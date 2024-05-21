@@ -1,9 +1,84 @@
 //! Subcommands for the `wdl-grammar` command-line tool.
 
+use clap::Parser;
+use clap::Subcommand;
 use log::debug;
+use log::LevelFilter;
 
 pub mod create_test;
 pub mod parse;
+
+/// Subcommands for the `wdl-grammar` command-line tool.
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Creates a test for a given input and grammar rule.
+    CreateTest(create_test::Args),
+
+    /// Parses an input according to the specified grammar rule.
+    Parse(parse::Args),
+}
+
+/// Parse and testing Workflow Description Language (WDL) grammar.
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about)]
+struct Args {
+    /// The subcommand to execute.
+    #[command(subcommand)]
+    command: Command,
+
+    /// Detailed information, including debug information, is logged in the
+    /// console.
+    #[arg(short, long, global = true)]
+    debug: bool,
+
+    /// Enables logging for all modules (not just `wdl-grammar`).
+    #[arg(short, long, global = true)]
+    log_all_modules: bool,
+
+    /// Only errors are logged to the console.
+    #[arg(short, long, global = true)]
+    quiet: bool,
+
+    /// All available information, including trace information, is logged in
+    /// the console.
+    #[arg(short, long, global = true)]
+    trace: bool,
+
+    /// Additional information is logged in the console.
+    #[arg(short, long, global = true)]
+    verbose: bool,
+}
+
+/// The inner function for the binary.
+pub async fn inner() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    let level = if args.trace {
+        LevelFilter::max()
+    } else if args.debug {
+        LevelFilter::Debug
+    } else if args.verbose {
+        LevelFilter::Info
+    } else if args.quiet {
+        LevelFilter::Error
+    } else {
+        LevelFilter::Warn
+    };
+
+    let module = match args.log_all_modules {
+        true => None,
+        false => Some("wdl_grammar"),
+    };
+
+    env_logger::builder().filter(module, level).init();
+
+    match args.command {
+        Command::CreateTest(args) => create_test::create_test(args)?,
+        Command::Parse(args) => parse::parse(args)?,
+    };
+
+    Ok(())
+}
 
 /// An error common to any subcommand.
 #[derive(Debug)]

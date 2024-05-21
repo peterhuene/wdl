@@ -21,6 +21,8 @@
 //! existing rules will be updated to use the new CST/AST representation
 //! at that time.
 
+#[cfg(feature = "binaries")]
+pub(crate) mod cli;
 pub mod grammar;
 pub mod lexer;
 pub mod parser;

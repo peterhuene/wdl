@@ -17,6 +17,9 @@ use super::lexer::LexerResult;
 use super::lexer::TokenSet;
 use super::tree::SyntaxKind;
 
+/// The maximum number of errors for the parser to emit.
+const MAXIMUM_ERRORS: usize = 20;
+
 /// Represents an event produced by the parser.
 ///
 /// The parser produces a stream of events that can be used to construct
@@ -253,6 +256,10 @@ pub enum Error {
         #[label(primary, "this parenthesis is not matched")]
         opening: SourceSpan,
     },
+    /// An error that is emitted when the maximum number of errors has been
+    /// reached.
+    #[error("encountered more than {MAXIMUM_ERRORS} errors; remaining errors are ignored")]
+    MaximumErrorsReached,
 }
 
 /// A trait implemented by parser tokens.
@@ -420,7 +427,13 @@ where
 
     /// Adds an error to the parser error list.
     pub fn error(&mut self, error: Error) {
-        self.errors.push(error);
+        match self.errors.len() {
+            n if n < MAXIMUM_ERRORS => self.errors.push(error),
+            MAXIMUM_ERRORS => {
+                self.errors.push(Error::MaximumErrorsReached);
+            }
+            _ => {}
+        }
     }
 
     /// Starts a new node event.
@@ -628,7 +641,13 @@ where
 
     /// Adds an error event to the event list.
     pub fn error(&mut self, error: Error) {
-        self.errors.push(error);
+        match self.errors.len() {
+            n if n < MAXIMUM_ERRORS => self.errors.push(error),
+            MAXIMUM_ERRORS => {
+                self.errors.push(Error::MaximumErrorsReached);
+            }
+            _ => {}
+        }
     }
 
     /// Recovers from an error by consuming all tokens not
