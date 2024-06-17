@@ -14,6 +14,7 @@ mod no_curly_commands;
 mod preamble_comments;
 mod preamble_whitespace;
 mod snake_case;
+mod unused_import;
 mod whitespace;
 
 pub use command_mixed_indentation::*;
@@ -25,6 +26,7 @@ pub use no_curly_commands::*;
 pub use preamble_comments::*;
 pub use preamble_whitespace::*;
 pub use snake_case::*;
+pub use unused_import::*;
 pub use whitespace::*;
 
 /// A trait implemented by lint rules.
@@ -68,6 +70,7 @@ pub fn rules() -> Vec<Box<dyn Rule>> {
         Box::new(MatchingParameterMetaRule),
         Box::new(WhitespaceRule),
         Box::new(CommandSectionMixedIndentationRule),
+        Box::new(UnusedImportRule),
     ];
 
     // Ensure all the rule ids are unique and pascal case

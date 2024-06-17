@@ -23,15 +23,42 @@ impl ImportStatement {
         child(&self.0).expect("import should have a URI")
     }
 
-    /// Gets the optional namespace of the import statement (i.e. the `as`
-    /// clause).
-    pub fn namespace(&self) -> Option<Ident> {
+    /// Gets the optional specified namespace of the import statement (i.e. the
+    /// `as` clause).
+    pub fn specified_namespace(&self) -> Option<Ident> {
         token(&self.0)
     }
 
     /// Gets the aliased names of the import statement.
     pub fn aliases(&self) -> AstChildren<ImportAlias> {
         children(&self.0)
+    }
+
+    /// Calculates the namespace introduced by this import statement.
+    ///
+    /// Returns `None` if the namespace URI is not a string containing only
+    /// literal text.
+    pub fn namespace(&self) -> Option<String> {
+        match self.specified_namespace() {
+            Some(ns) => Some(ns.as_str().to_string()),
+            _ => {
+                let uri = self.uri();
+                let text = uri.text()?;
+                let last_slash = text.as_str().char_indices().rev().find(|(_, c)| *c == '/');
+                let last_backslash = text.as_str().char_indices().rev().find(|(_, c)| *c == '\\');
+
+                let start = match (last_slash, last_backslash) {
+                    (None, None) => 0,
+                    (None, Some((i, _))) => i + 1,
+                    (Some((i, _)), None) => i + 1,
+                    (Some((s, _)), Some((bs, _))) => s.max(bs) + 1,
+                };
+
+                // TODO: this should probably check to see if the resulting namespace is a valid identifier.
+                let ns = &text.as_str()[start..];
+                Some(ns.strip_suffix(".wdl").unwrap_or(ns).to_string())
+            }
+        }
     }
 }
 
@@ -145,22 +172,22 @@ import "qux.wdl" as x alias A as B alias C as D
 
                 // First import statement
                 assert_eq!(imports[0].uri().text().unwrap().as_str(), "foo.wdl");
-                assert!(imports[0].namespace().is_none());
+                assert!(imports[0].specified_namespace().is_none());
                 assert_eq!(imports[0].aliases().count(), 0);
 
                 // Second import statement
                 assert_eq!(imports[1].uri().text().unwrap().as_str(), "bar.wdl");
-                assert_eq!(imports[1].namespace().unwrap().as_str(), "x");
+                assert_eq!(imports[1].specified_namespace().unwrap().as_str(), "x");
                 assert_eq!(imports[1].aliases().count(), 0);
 
                 // Third import statement
                 assert_eq!(imports[2].uri().text().unwrap().as_str(), "baz.wdl");
-                assert!(imports[2].namespace().is_none());
+                assert!(imports[2].specified_namespace().is_none());
                 assert_aliases(imports[2].aliases());
 
                 // Fourth import statement
                 assert_eq!(imports[3].uri().text().unwrap().as_str(), "qux.wdl");
-                assert_eq!(imports[3].namespace().unwrap().as_str(), "x");
+                assert_eq!(imports[3].specified_namespace().unwrap().as_str(), "x");
                 assert_aliases(imports[3].aliases());
 
                 // Use a visitor to visit the import statements in the tree
