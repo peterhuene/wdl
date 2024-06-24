@@ -70,12 +70,12 @@ pub struct ParseCommand {
 impl ParseCommand {
     fn exec(self) -> Result<()> {
         let source = read_source(&self.path)?;
-        let parse = Document::parse(&source);
-        if !parse.diagnostics().is_empty() {
-            emit_diagnostics(&self.path, &source, parse.diagnostics())?;
+        let (document, diagnostics) = Document::parse(&source);
+        if !diagnostics.is_empty() {
+            emit_diagnostics(&self.path, &source, &diagnostics)?;
         }
 
-        println!("{document:#?}", document = parse.document());
+        println!("{document:#?}");
         Ok(())
     }
 }
@@ -92,28 +92,26 @@ pub struct CheckCommand {
 impl CheckCommand {
     fn exec(self) -> Result<()> {
         let source = read_source(&self.path)?;
-        match Document::parse(&source).into_result() {
-            Ok(document) => {
-                let validator = Validator::default();
-                if let Err(diagnostics) = validator.validate(&document) {
-                    emit_diagnostics(&self.path, &source, &diagnostics)?;
+        let (document, diagnostics) = Document::parse(&source);
+        if !diagnostics.is_empty() {
+            emit_diagnostics(&self.path, &source, &diagnostics)?;
 
-                    bail!(
-                        "aborting due to previous {count} diagnostic{s}",
-                        count = diagnostics.len(),
-                        s = if diagnostics.len() == 1 { "" } else { "s" }
-                    );
-                }
-            }
-            Err(diagnostics) => {
-                emit_diagnostics(&self.path, &source, &diagnostics)?;
+            bail!(
+                "aborting due to previous {count} diagnostic{s}",
+                count = diagnostics.len(),
+                s = if diagnostics.len() == 1 { "" } else { "s" }
+            );
+        }
 
-                bail!(
-                    "aborting due to previous {count} diagnostic{s}",
-                    count = diagnostics.len(),
-                    s = if diagnostics.len() == 1 { "" } else { "s" }
-                );
-            }
+        let mut validator = Validator::default();
+        if let Err(diagnostics) = validator.validate(&document) {
+            emit_diagnostics(&self.path, &source, &diagnostics)?;
+
+            bail!(
+                "aborting due to previous {count} diagnostic{s}",
+                count = diagnostics.len(),
+                s = if diagnostics.len() == 1 { "" } else { "s" }
+            );
         }
 
         Ok(())
@@ -132,29 +130,27 @@ pub struct LintCommand {
 impl LintCommand {
     fn exec(self) -> Result<()> {
         let source = read_source(&self.path)?;
-        match Document::parse(&source).into_result() {
-            Ok(document) => {
-                let mut validator = Validator::default();
-                validator.add_visitor(LintVisitor::default());
-                if let Err(diagnostics) = validator.validate(&document) {
-                    emit_diagnostics(&self.path, &source, &diagnostics)?;
+        let (document, diagnostics) = Document::parse(&source);
+        if !diagnostics.is_empty() {
+            emit_diagnostics(&self.path, &source, &diagnostics)?;
 
-                    bail!(
-                        "aborting due to previous {count} diagnostic{s}",
-                        count = diagnostics.len(),
-                        s = if diagnostics.len() == 1 { "" } else { "s" }
-                    );
-                }
-            }
-            Err(diagnostics) => {
-                emit_diagnostics(&self.path, &source, &diagnostics)?;
+            bail!(
+                "aborting due to previous {count} diagnostic{s}",
+                count = diagnostics.len(),
+                s = if diagnostics.len() == 1 { "" } else { "s" }
+            );
+        }
 
-                bail!(
-                    "aborting due to previous {count} diagnostic{s}",
-                    count = diagnostics.len(),
-                    s = if diagnostics.len() == 1 { "" } else { "s" }
-                );
-            }
+        let mut validator = Validator::default();
+        validator.add_visitor(LintVisitor::default());
+        if let Err(diagnostics) = validator.validate(&document) {
+            emit_diagnostics(&self.path, &source, &diagnostics)?;
+
+            bail!(
+                "aborting due to previous {count} diagnostic{s}",
+                count = diagnostics.len(),
+                s = if diagnostics.len() == 1 { "" } else { "s" }
+            );
         }
 
         Ok(())

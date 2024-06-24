@@ -1,4 +1,4 @@
-//! Validation of various counts in a V1 AST.
+//! Validation of various counts in an AST.
 
 use std::fmt;
 
@@ -59,6 +59,7 @@ impl fmt::Display for Section {
 /// Creates a "at least one definition" diagnostic
 fn at_least_one_definition() -> Diagnostic {
     Diagnostic::error("there must be at least one task, workflow, or struct definition in the file")
+        .with_highlight(Span::new(usize::MAX, 0))
 }
 
 /// Creates a "duplicate workflow" diagnostic
@@ -174,8 +175,15 @@ impl CountingVisitor {
 impl Visitor for CountingVisitor {
     type State = Diagnostics;
 
-    fn document(&mut self, state: &mut Self::State, reason: VisitReason, _: &Document) {
+    fn document(&mut self, state: &mut Self::State, reason: VisitReason, doc: &Document) {
         if reason == VisitReason::Enter {
+            // Upon entry of of a document, reset the visitor entirely.
+            *self = Default::default();
+            return;
+        }
+
+        // Ignore documents that are missing a version statement
+        if doc.version_statement().is_none() {
             return;
         }
 

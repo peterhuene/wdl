@@ -5,6 +5,7 @@ use wdl_ast::v1::InputSection;
 use wdl_ast::AstNode;
 use wdl_ast::Diagnostic;
 use wdl_ast::Diagnostics;
+use wdl_ast::Document;
 use wdl_ast::Span;
 use wdl_ast::VisitReason;
 use wdl_ast::Visitor;
@@ -25,7 +26,7 @@ fn input_not_sorted(span: Span, sorted_inputs: String) -> Diagnostic {
 }
 
 /// Detects unsorted input declarations.
-#[derive(Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct InputNotSortedRule;
 
 impl Rule for InputNotSortedRule {
@@ -56,6 +57,15 @@ impl Rule for InputNotSortedRule {
 
 impl Visitor for InputNotSortedRule {
     type State = Diagnostics;
+
+    fn document(&mut self, _: &mut Self::State, reason: VisitReason, _: &Document) {
+        if reason != VisitReason::Enter {
+            return;
+        }
+
+        // Reset the visitor upon document entry
+        *self = Default::default();
+    }
 
     fn input_section(
         &mut self,

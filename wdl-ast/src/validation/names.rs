@@ -1,4 +1,4 @@
-//! Validation of unique names in a V1 AST.
+//! Validation of unique names in an AST.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -18,6 +18,7 @@ use crate::v1::UnboundDecl;
 use crate::v1::WorkflowDefinition;
 use crate::AstToken;
 use crate::Diagnostics;
+use crate::Document;
 use crate::Ident;
 use crate::VisitReason;
 use crate::Visitor;
@@ -158,6 +159,15 @@ pub struct UniqueNamesVisitor {
 
 impl Visitor for UniqueNamesVisitor {
     type State = Diagnostics;
+
+    fn document(&mut self, _: &mut Self::State, reason: VisitReason, _: &Document) {
+        if reason != VisitReason::Enter {
+            return;
+        }
+
+        // Reset the visitor upon document entry
+        *self = Default::default();
+    }
 
     fn import_statement(
         &mut self,

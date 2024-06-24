@@ -30,7 +30,7 @@ ast = ["dep:wdl-ast"]
 grammar = ["dep:wdl-grammar"]
 lint = ["dep:wdl-lint"]
 codespan = ["ast", "wdl-ast/codespan", "dep:codespan-reporting"]
-binaries = ["codespan", "lint", "dep:clap", "dep:anyhow", "dep:colored"]
+cli = ["codespan", "lint", "dep:clap", "dep:anyhow", "dep:colored"]
 
 [[example]]
 name = "explore"
@@ -42,7 +42,7 @@ required-features = ["codespan"]
 
 [[bin]]
 name = "wdl"
-required-features = ["binaries"]
+required-features = ["cli"]
 
 [package.metadata.docs.rs]
 all-features = true

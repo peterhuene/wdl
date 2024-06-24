@@ -1,7 +1,6 @@
 //! Validator for WDL documents.
 
 use std::cmp::Ordering;
-use std::sync::Arc;
 
 use super::v1;
 use super::Comment;
@@ -13,6 +12,7 @@ use crate::VersionStatement;
 use crate::Visitor;
 
 mod counts;
+mod imports;
 mod keys;
 mod names;
 mod numbers;
@@ -44,10 +44,9 @@ impl Diagnostics {
 ///
 /// ```rust
 /// # use wdl_ast::{Document, Validator};
-/// let document = Document::parse("version 1.1\nworkflow example {}")
-///     .into_result()
-///     .expect("should parse without errors");
-/// let validator = Validator::default();
+/// let (document, diagnostics) = Document::parse("version 1.1\nworkflow example {}");
+/// assert!(diagnostics.is_empty());
+/// let mut validator = Validator::default();
 /// assert!(validator.validate(&document).is_ok());
 /// ```
 #[allow(missing_debug_implementations)]
@@ -58,9 +57,9 @@ pub struct Validator {
 
 impl Validator {
     /// Creates a validator with an empty visitors set.
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
-            visitors: Default::default(),
+            visitors: Vec::new(),
         }
     }
 
@@ -79,9 +78,9 @@ impl Validator {
 
     /// Validates the given document and returns the validation errors upon
     /// failure.
-    pub fn validate(mut self, document: &Document) -> Result<(), Arc<[Diagnostic]>> {
+    pub fn validate(&mut self, document: &Document) -> Result<(), Vec<Diagnostic>> {
         let mut diagnostics = Diagnostics::default();
-        document.visit(&mut diagnostics, &mut self);
+        document.visit(&mut diagnostics, self);
 
         if diagnostics.0.is_empty() {
             Ok(())
@@ -95,7 +94,7 @@ impl Validator {
                     (Some(_), None) => Ordering::Greater,
                     (Some(a), Some(b)) => a.span().start().cmp(&b.span().start()),
                 });
-            Err(diagnostics.0.into())
+            Err(diagnostics.0)
         }
     }
 }
@@ -110,6 +109,7 @@ impl Default for Validator {
                 Box::<keys::UniqueKeysVisitor>::default(),
                 Box::<numbers::NumberVisitor>::default(),
                 Box::<names::UniqueNamesVisitor>::default(),
+                Box::<imports::ImportVisitor>::default(),
             ],
         }
     }
