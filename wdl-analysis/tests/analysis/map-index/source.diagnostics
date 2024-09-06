@@ -1,0 +1,6 @@
+error: index type mismatch: expected type `String`, but found type `Int`
+   ┌─ tests/analysis/map-index/source.wdl:12:18
+   │
+12 │     String y = a[5]
+   │                  ^ this is type `Int`
+

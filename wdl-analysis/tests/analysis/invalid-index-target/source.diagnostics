@@ -1,0 +1,6 @@
+error: cannot index type `String`
+  ┌─ tests/analysis/invalid-index-target/source.wdl:7:16
+  │
+7 │     String x = a[0]
+  │                ^ this is type `String`
+

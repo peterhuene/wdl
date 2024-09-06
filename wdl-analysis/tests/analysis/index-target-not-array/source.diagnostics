@@ -1,6 +1,0 @@
-error: index target type mismatch: expected type `Array`, but found type `String`
-  ┌─ tests/analysis/index-target-not-array/source.wdl:7:16
-  │
-7 │     String x = a[0]
-  │                ^ this is type `String`
-

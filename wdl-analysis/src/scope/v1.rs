@@ -55,11 +55,13 @@ use super::ScopeRefMut;
 use super::Struct;
 use super::Task;
 use super::Workflow;
+use crate::diagnostics::type_mismatch;
+use crate::diagnostics::unknown_name;
+use crate::diagnostics::unknown_type;
 use crate::graph::DocumentGraph;
 use crate::graph::ParseState;
 use crate::scope::ScopeRef;
 use crate::scope::TaskOutputScope;
-use crate::types::v1::type_mismatch;
 use crate::types::v1::AstTypeConverter;
 use crate::types::v1::ExprTypeEvaluator;
 use crate::types::Coercible;
@@ -216,24 +218,6 @@ fn recursive_struct(name: &str, span: Span, member: Span) -> Diagnostic {
     Diagnostic::error(format!("struct `{name}` has a recursive definition",))
         .with_highlight(span)
         .with_label("this struct member participates in the recursion", member)
-}
-
-/// Creates an "unknown type" diagnostic.
-fn unknown_type(name: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(format!("unknown type name `{name}`")).with_highlight(span)
-}
-
-/// Creates an "unknown name" diagnostic.
-fn unknown_name(name: &str, span: Span) -> Diagnostic {
-    // Handle special case names here
-    let message = match name {
-        "task" => "the `task` variable may only be used within a task command section or task \
-                   output section using WDL 1.2 or later"
-            .to_string(),
-        _ => format!("unknown name `{name}`"),
-    };
-
-    Diagnostic::error(message).with_highlight(span)
 }
 
 /// Creates a "self-referential" diagnostic.

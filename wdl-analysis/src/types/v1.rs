@@ -1,6 +1,5 @@
 //! Type conversion helpers for a V1 AST.
 
-use std::fmt;
 use std::fmt::Write;
 
 use wdl_ast::v1;
@@ -44,368 +43,39 @@ use super::StructType;
 use super::Type;
 use super::TypeEq;
 use super::Types;
+use crate::diagnostics::ambiguous_argument;
+use crate::diagnostics::argument_type_mismatch;
+use crate::diagnostics::cannot_access;
+use crate::diagnostics::cannot_coerce_to_string;
+use crate::diagnostics::cannot_index;
+use crate::diagnostics::comparison_mismatch;
+use crate::diagnostics::if_conditional_mismatch;
+use crate::diagnostics::index_type_mismatch;
+use crate::diagnostics::logical_and_mismatch;
+use crate::diagnostics::logical_not_mismatch;
+use crate::diagnostics::logical_or_mismatch;
+use crate::diagnostics::map_key_not_primitive;
+use crate::diagnostics::missing_struct_members;
+use crate::diagnostics::negation_mismatch;
+use crate::diagnostics::not_a_pair_accessor;
+use crate::diagnostics::not_a_struct;
+use crate::diagnostics::not_a_struct_member;
+use crate::diagnostics::not_a_task_member;
+use crate::diagnostics::not_io_name;
+use crate::diagnostics::numeric_mismatch;
+use crate::diagnostics::string_concat_mismatch;
+use crate::diagnostics::too_few_arguments;
+use crate::diagnostics::too_many_arguments;
+use crate::diagnostics::type_mismatch;
+use crate::diagnostics::type_mismatch_custom;
+use crate::diagnostics::unknown_function;
+use crate::diagnostics::unsupported_function;
+use crate::diagnostics::ComparisonOperator;
+use crate::diagnostics::NumericOperator;
 use crate::scope::ScopeRef;
 use crate::stdlib::FunctionBindError;
 use crate::stdlib::STDLIB;
 use crate::types::Coercible;
-
-/// Creates a "type mismatch" diagnostic.
-pub(crate) fn type_mismatch(
-    types: &Types,
-    expected: Type,
-    expected_span: Span,
-    actual: Type,
-    actual_span: Span,
-) -> Diagnostic {
-    Diagnostic::error(format!(
-        "type mismatch: expected type `{expected}`, but found type `{actual}`",
-        expected = expected.display(types),
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-    .with_label(
-        format!(
-            "this is type `{expected}`",
-            expected = expected.display(types)
-        ),
-        expected_span,
-    )
-}
-
-/// Creates a custom "type mismatch" diagnostic.
-fn type_mismatch_custom(
-    types: &Types,
-    expected: &str,
-    expected_span: Span,
-    actual: Type,
-    actual_span: Span,
-) -> Diagnostic {
-    Diagnostic::error(format!(
-        "type mismatch: expected {expected}, but found type `{actual}`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-    .with_label(format!("this expects {expected}"), expected_span)
-}
-
-/// Creates a "not a task member" diagnostic.
-fn not_a_task_member(member: &Ident) -> Diagnostic {
-    Diagnostic::error(format!(
-        "the `task` variable does not have a member named `{member}`",
-        member = member.as_str()
-    ))
-    .with_highlight(member.span())
-}
-
-/// Creates a "not an I/O name" diagnostic.
-fn not_io_name(name: &Ident, input: bool) -> Diagnostic {
-    Diagnostic::error(format!(
-        "an {kind} with name `{name}` does not exist",
-        kind = if input { "input" } else { "output" },
-        name = name.as_str(),
-    ))
-    .with_highlight(name.span())
-}
-
-/// Creates a "not a struct" diagnostic.
-fn not_a_struct(member: &Ident, input: bool) -> Diagnostic {
-    Diagnostic::error(format!(
-        "{kind} `{member}` is not a struct",
-        kind = if input { "input" } else { "struct member" },
-        member = member.as_str()
-    ))
-    .with_highlight(member.span())
-}
-
-/// Creates a "not a struct member" diagnostic.
-fn not_a_struct_member(name: &str, member: &Ident) -> Diagnostic {
-    Diagnostic::error(format!(
-        "struct `{name}` does not have a member named `{member}`",
-        member = member.as_str()
-    ))
-    .with_highlight(member.span())
-}
-
-/// Creates a "not a pair accessor" diagnostic.
-fn not_a_pair_accessor(name: &Ident) -> Diagnostic {
-    Diagnostic::error(format!(
-        "cannot access a pair with name `{name}`",
-        name = name.as_str()
-    ))
-    .with_highlight(name.span())
-    .with_fix("use `left` or `right` to access a pair")
-}
-
-/// Creates a "missing struct members" diagnostic.
-fn missing_struct_members(name: &Ident, count: usize, members: &str) -> Diagnostic {
-    Diagnostic::error(format!(
-        "struct `{name}` requires a value for member{s} {members}",
-        name = name.as_str(),
-        s = if count > 1 { "s" } else { "" },
-    ))
-    .with_highlight(name.span())
-}
-
-/// Creates a "map key not primitive" diagnostic.
-fn map_key_not_primitive(types: &Types, span: Span, actual: Type, actual_span: Span) -> Diagnostic {
-    Diagnostic::error("expected map literal to use primitive type keys")
-        .with_highlight(span)
-        .with_label(
-            format!("this is type `{actual}`", actual = actual.display(types)),
-            actual_span,
-        )
-}
-
-/// Creates a "if conditional mismatch" diagnostic.
-fn if_conditional_mismatch(types: &Types, actual: Type, actual_span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "type mismatch: expected `if` conditional expression to be type `Boolean`, but found type \
-         `{actual}`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-}
-
-/// Creates a "logical not mismatch" diagnostic.
-fn logical_not_mismatch(types: &Types, actual: Type, actual_span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "type mismatch: expected `logical not` operand to be type `Boolean`, but found type \
-         `{actual}`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-}
-
-/// Creates a "negation mismatch" diagnostic.
-fn negation_mismatch(types: &Types, actual: Type, actual_span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "type mismatch: expected negation operand to be type `Int` or `Float`, but found type \
-         `{actual}`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-}
-
-/// Creates a "logical or mismatch" diagnostic.
-fn logical_or_mismatch(types: &Types, actual: Type, actual_span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "type mismatch: expected `logical or` operand to be type `Boolean`, but found type \
-         `{actual}`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-}
-
-/// Creates a "logical and mismatch" diagnostic.
-fn logical_and_mismatch(types: &Types, actual: Type, actual_span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "type mismatch: expected `logical and` operand to be type `Boolean`, but found type \
-         `{actual}`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-}
-
-/// Creates a "comparison mismatch" diagnostic.
-fn comparison_mismatch(
-    types: &Types,
-    op: ComparisonOperator,
-    span: Span,
-    lhs: Type,
-    lhs_span: Span,
-    rhs: Type,
-    rhs_span: Span,
-) -> Diagnostic {
-    Diagnostic::error(format!(
-        "type mismatch: operator `{op}` cannot compare type `{lhs}` to type `{rhs}`",
-        lhs = lhs.display(types),
-        rhs = rhs.display(types),
-    ))
-    .with_highlight(span)
-    .with_label(
-        format!("this is type `{lhs}`", lhs = lhs.display(types)),
-        lhs_span,
-    )
-    .with_label(
-        format!("this is type `{rhs}`", rhs = rhs.display(types)),
-        rhs_span,
-    )
-}
-
-/// Creates a "numeric mismatch" diagnostic.
-fn numeric_mismatch(
-    types: &Types,
-    op: NumericOperator,
-    span: Span,
-    lhs: Type,
-    lhs_span: Span,
-    rhs: Type,
-    rhs_span: Span,
-) -> Diagnostic {
-    Diagnostic::error(format!(
-        "type mismatch: {op} operator is not supported for type `{lhs}` and type `{rhs}`",
-        lhs = lhs.display(types),
-        rhs = rhs.display(types)
-    ))
-    .with_highlight(span)
-    .with_label(
-        format!("this is type `{lhs}`", lhs = lhs.display(types)),
-        lhs_span,
-    )
-    .with_label(
-        format!("this is type `{rhs}`", rhs = rhs.display(types)),
-        rhs_span,
-    )
-}
-
-/// Creates a "string concat mismatch" diagnostic.
-fn string_concat_mismatch(types: &Types, actual: Type, actual_span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "type mismatch: string concatenation is not supported for type `{actual}`",
-        actual = actual.display(types),
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-}
-
-/// Creates an "unknown function" diagnostic.
-fn unknown_function(name: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(format!("unknown function `{name}`")).with_label(
-        "the WDL standard library does not have a function with this name",
-        span,
-    )
-}
-
-/// Creates an "unsupported function" diagnostic.
-fn unsupported_function(minimum: SupportedVersion, name: &str, span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "function `{name}` requires a minimum WDL version of {minimum}"
-    ))
-    .with_highlight(span)
-}
-
-/// Creates a "too few arguments" diagnostic.
-fn too_few_arguments(name: &str, span: Span, minimum: usize, count: usize) -> Diagnostic {
-    Diagnostic::error(format!(
-        "function `{name}` requires at least {minimum} argument{s} but {count} {v} supplied",
-        s = if minimum == 1 { "" } else { "s" },
-        v = if count == 1 { "was" } else { "were" },
-    ))
-    .with_highlight(span)
-}
-
-/// Creates a "too many arguments" diagnostic.
-fn too_many_arguments(
-    name: &str,
-    span: Span,
-    maximum: usize,
-    count: usize,
-    excessive: impl Iterator<Item = Span>,
-) -> Diagnostic {
-    let mut diagnostic = Diagnostic::error(format!(
-        "function `{name}` requires no more than {maximum} argument{s} but {count} {v} supplied",
-        s = if maximum == 1 { "" } else { "s" },
-        v = if count == 1 { "was" } else { "were" },
-    ))
-    .with_highlight(span);
-
-    for span in excessive {
-        diagnostic = diagnostic.with_label("this argument is unexpected", span);
-    }
-
-    diagnostic
-}
-
-/// Constructs an "argument type mismatch" diagnostic.
-fn argument_type_mismatch(types: &Types, expected: &str, actual: Type, span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "argument type mismatch: expected type {expected}, but found type `{actual}`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        span,
-    )
-}
-
-/// Constructs an "ambiguous argument" diagnostic.
-fn ambiguous_argument(name: &str, span: Span, first: &str, second: &str) -> Diagnostic {
-    Diagnostic::error(format!(
-        "ambiguous call to function `{name}` with conflicting signatures `{first}` and `{second}`",
-    ))
-    .with_highlight(span)
-}
-
-/// Constructs an "integer not integer" diagnostic.
-fn index_not_integer(types: &Types, actual: Type, actual_span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "index type mismatch: expected type `Int`, but found type `{actual}`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-}
-
-/// Constructs an "index target not array" diagnostic.
-fn index_target_not_array(types: &Types, actual: Type, actual_span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "index target type mismatch: expected type `Array`, but found type `{actual}`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-}
-
-/// Constructs a "cannot access" diagnostic.
-fn cannot_access(types: &Types, actual: Type, actual_span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "cannot access type `{actual}`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        actual_span,
-    )
-}
-
-/// Constructs a "cannot coerce to string" diagnostic.
-fn cannot_coerce_to_string(types: &Types, actual: Type, span: Span) -> Diagnostic {
-    Diagnostic::error(format!(
-        "cannot coerce type `{actual}` to `String`",
-        actual = actual.display(types)
-    ))
-    .with_label(
-        format!("this is type `{actual}`", actual = actual.display(types)),
-        span,
-    )
-}
 
 /// Gets the type of a `task` variable member type.
 ///
@@ -422,74 +92,6 @@ pub fn task_member_type(name: &str) -> Option<Type> {
         "end_time" | "return_code" => Some(Type::from(PrimitiveTypeKind::Integer).optional()),
         "meta" | "parameter_meta" | "ext" => Some(Type::Object),
         _ => None,
-    }
-}
-
-/// Represents a comparison operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ComparisonOperator {
-    /// The `==` operator.
-    Equality,
-    /// The `!=` operator.
-    Inequality,
-    /// The `>` operator.
-    Less,
-    /// The `<=` operator.
-    LessEqual,
-    /// The `>` operator.
-    Greater,
-    /// The `>=` operator.
-    GreaterEqual,
-}
-
-impl fmt::Display for ComparisonOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Equality => "==",
-                Self::Inequality => "!=",
-                Self::Less => "<",
-                Self::LessEqual => "<=",
-                Self::Greater => ">",
-                Self::GreaterEqual => ">=",
-            }
-        )
-    }
-}
-
-/// Represents a numeric operator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NumericOperator {
-    /// The `+` operator.
-    Addition,
-    /// The `-` operator.
-    Subtraction,
-    /// The `*` operator.
-    Multiplication,
-    /// The `/` operator.
-    Division,
-    /// The `%` operator.
-    Modulo,
-    /// The `**` operator.
-    Exponentiation,
-}
-
-impl fmt::Display for NumericOperator {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                Self::Addition => "addition",
-                Self::Subtraction => "subtraction",
-                Self::Multiplication => "multiplication",
-                Self::Division => "division",
-                Self::Modulo => "remainder",
-                Self::Exponentiation => "exponentiation",
-            }
-        )
     }
 }
 
@@ -884,7 +486,6 @@ where
                 _ => {
                     self.diagnostics.push(map_key_not_primitive(
                         self.types,
-                        key.span(),
                         expected_key,
                         key.span(),
                     ));
@@ -1908,30 +1509,47 @@ where
         let (target, index) = expr.operands();
 
         // Determine the element type of the target expression
-        let array_type = self.evaluate_expr(scope, &target)?;
-        let element_type = match array_type {
+        let target_type = self.evaluate_expr(scope, &target)?;
+        let index_ty = self.evaluate_expr(scope, &index).unwrap_or(Type::Union);
+
+        let ty = match target_type {
             Type::Compound(ty) => match self.types.type_definition(ty.definition()) {
-                CompoundTypeDef::Array(ty) => Some(ty.element_type()),
+                CompoundTypeDef::Array(ty) => {
+                    // Check that the index is an integer
+                    if !index_ty.is_coercible_to(self.types, &PrimitiveTypeKind::Integer.into()) {
+                        self.diagnostics.push(index_type_mismatch(
+                            self.types,
+                            PrimitiveTypeKind::Integer.into(),
+                            index_ty,
+                            index.span(),
+                        ));
+                    }
+
+                    Some(ty.element_type)
+                }
+                CompoundTypeDef::Map(ty) => {
+                    // Check that the index is coercible to the map type
+                    if !index_ty.is_coercible_to(self.types, &ty.key_type) {
+                        self.diagnostics.push(index_type_mismatch(
+                            self.types,
+                            ty.key_type,
+                            index_ty,
+                            index.span(),
+                        ));
+                    }
+
+                    Some(ty.value_type)
+                }
                 _ => None,
             },
             _ => None,
         };
 
-        // Check that the index is an integer
-        let index_ty = self.evaluate_expr(scope, &index).unwrap_or(Type::Union);
-        if !index_ty.is_coercible_to(self.types, &PrimitiveTypeKind::Integer.into()) {
-            self.diagnostics
-                .push(index_not_integer(self.types, index_ty, index.span()));
-        }
-
-        match element_type {
+        match ty {
             Some(ty) => Some(ty),
             None => {
-                self.diagnostics.push(index_target_not_array(
-                    self.types,
-                    array_type,
-                    target.span(),
-                ));
+                self.diagnostics
+                    .push(cannot_index(self.types, target_type, target.span()));
                 None
             }
         }
