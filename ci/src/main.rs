@@ -56,7 +56,8 @@ const SORTED_CRATES_TO_PUBLISH: &[&str] = &[
     "wdl-lint",
     "wdl-format",
     "wdl-analysis",
-    "wdl-engine",
+    // Uncomment this for the next full release.
+    // "wdl-engine",
     "wdl-lsp",
     "wdl",
 ];
