@@ -2,10 +2,12 @@
 
 use std::sync::Arc;
 
+use anyhow::Result;
 use id_arena::Arena;
 use id_arena::ArenaBehavior;
 use id_arena::DefaultArenaBehavior;
 use string_interner::DefaultStringInterner;
+use wdl_analysis::document::Document;
 use wdl_analysis::types::CompoundTypeDef;
 use wdl_analysis::types::Type;
 use wdl_analysis::types::Types;
@@ -14,8 +16,10 @@ use crate::Array;
 use crate::Coercible;
 use crate::CompoundValue;
 use crate::CompoundValueId;
+use crate::Inputs;
 use crate::Map;
 use crate::Object;
+use crate::Outputs;
 use crate::Pair;
 use crate::Struct;
 use crate::Value;
@@ -45,6 +49,24 @@ impl Engine {
     /// Gets a mutable reference to the engine's type collection.
     pub fn types_mut(&mut self) -> &mut Types {
         &mut self.types
+    }
+
+    /// Evaluates a workflow.
+    ///
+    /// Returns the workflow outputs upon success.
+    pub async fn evaluate_workflow(document: &Document, inputs: &Inputs) -> Result<Outputs> {
+        todo!()
+    }
+
+    /// Evaluates a task with the given name.
+    ///
+    /// Returns the task outputs upon success.
+    pub async fn evaluate_task(
+        document: &Document,
+        task: &str,
+        inputs: &Inputs,
+    ) -> Result<Outputs> {
+        todo!()
     }
 
     /// Creates a new `String` value.
