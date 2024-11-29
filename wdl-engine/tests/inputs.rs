@@ -35,11 +35,11 @@ use pretty_assertions::StrComparison;
 use wdl_analysis::AnalysisResult;
 use wdl_analysis::Analyzer;
 use wdl_analysis::rules;
+use wdl_analysis::types::Types;
 use wdl_ast::Diagnostic;
 use wdl_ast::Severity;
 use wdl_ast::SyntaxNode;
-use wdl_engine::Engine;
-use wdl_engine::InputsFile;
+use wdl_engine::Inputs;
 
 /// Finds tests to run as part of the analysis test suite.
 fn find_tests() -> Vec<PathBuf> {
@@ -147,26 +147,29 @@ fn run_test(test: &Path, result: AnalysisResult) -> Result<()> {
         bail!("document `{path}` contains at least one diagnostic error:\n{diagnostic}");
     }
 
-    let mut engine = Engine::default();
+    let mut types = Types::default();
     let document = result.document();
-    let result = match InputsFile::parse(engine.types_mut(), document, test.join("inputs.json")) {
-        Ok(inputs) => {
-            if let Some((task, inputs)) = inputs.as_task_inputs() {
+    let result = match Inputs::parse(&mut types, document, test.join("inputs.json")) {
+        Ok(Some((name, inputs))) => match inputs {
+            Inputs::Task(inputs) => {
                 match inputs
                     .validate(
-                        engine.types_mut(),
+                        &mut types,
                         document,
-                        document.task_by_name(task).expect("task should be present"),
+                        document
+                            .task_by_name(&name)
+                            .expect("task should be present"),
                     )
-                    .with_context(|| format!("failed to validate the inputs to task `{task}`"))
+                    .with_context(|| format!("failed to validate the inputs to task `{name}`"))
                 {
                     Ok(()) => String::new(),
                     Err(e) => format!("{e:?}"),
                 }
-            } else if let Some(inputs) = inputs.as_workflow_inputs() {
+            }
+            Inputs::Workflow(inputs) => {
                 let workflow = document.workflow().expect("workflow should be present");
                 match inputs
-                    .validate(engine.types_mut(), document, workflow)
+                    .validate(&mut types, document, workflow)
                     .with_context(|| {
                         format!(
                             "failed to validate the inputs to workflow `{workflow}`",
@@ -176,10 +179,9 @@ fn run_test(test: &Path, result: AnalysisResult) -> Result<()> {
                     Ok(()) => String::new(),
                     Err(e) => format!("{e:?}"),
                 }
-            } else {
-                panic!("expected either a task input or a workflow input");
             }
-        }
+        },
+        Ok(None) => String::new(),
         Err(e) => format!("{e:?}"),
     };
 
