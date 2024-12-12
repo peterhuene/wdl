@@ -102,14 +102,14 @@ pub trait TaskExecution: Send {
     /// task's process.
     fn spawn(
         &self,
-        command: String,
+        command: &str,
         requirements: &HashMap<String, Value>,
         hints: &HashMap<String, Value>,
     ) -> Result<BoxFuture<'static, Result<i32>>>;
 }
 
 /// Represents a task execution backend.
-pub trait TaskExecutionBackend {
+pub trait TaskExecutionBackend: Send + Sync {
     /// Creates a new task execution.
     ///
     /// The specified directory serves as the root location of where a task

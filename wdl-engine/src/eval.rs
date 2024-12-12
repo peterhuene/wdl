@@ -95,6 +95,13 @@ pub trait EvaluationContext {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ScopeIndex(usize);
 
+impl ScopeIndex {
+    /// Constructs a new scope index from a raw index.
+    pub const fn new(index: usize) -> Self {
+        Self(index)
+    }
+}
+
 impl From<usize> for ScopeIndex {
     fn from(index: usize) -> Self {
         Self(index)
@@ -129,7 +136,8 @@ impl Scope {
 
     /// Inserts a name into the scope.
     pub fn insert(&mut self, name: impl Into<String>, value: impl Into<Value>) {
-        self.names.insert(name.into(), value.into());
+        let prev = self.names.insert(name.into(), value.into());
+        assert!(prev.is_none(), "conflicting name in scope");
     }
 
     /// Gets a mutable reference to an existing name in scope.

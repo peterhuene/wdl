@@ -9,7 +9,9 @@ use sysinfo::System;
 use wdl_analysis::diagnostics::unknown_type;
 use wdl_analysis::document::Document;
 use wdl_analysis::types::Type;
+use wdl_analysis::types::TypeNameResolver;
 use wdl_analysis::types::Types;
+use wdl_analysis::types::v1::AstTypeConverter;
 use wdl_ast::AstToken;
 use wdl_ast::Diagnostic;
 use wdl_ast::Ident;
@@ -100,5 +102,36 @@ impl Engine {
                 Ok(ty)
             }
         }
+    }
+
+    /// Converts a V1 AST type to an analysis type.
+    pub(crate) fn convert_ast_type_v1(
+        &mut self,
+        document: &Document,
+        ty: &wdl_ast::v1::Type,
+    ) -> Result<Type, Diagnostic> {
+        /// Used to resolve a type name from a document.
+        struct Resolver<'a> {
+            /// The engine that we'll resolve type names with.
+            engine: &'a mut Engine,
+            /// The document containing the type name to resolve.
+            document: &'a Document,
+        }
+
+        impl TypeNameResolver for Resolver<'_> {
+            fn types_mut(&mut self) -> &mut Types {
+                self.engine.types_mut()
+            }
+
+            fn resolve_type_name(&mut self, name: &Ident) -> Result<Type, Diagnostic> {
+                self.engine.resolve_type_name(self.document, name)
+            }
+        }
+
+        AstTypeConverter::new(Resolver {
+            engine: self,
+            document,
+        })
+        .convert_type(ty)
     }
 }

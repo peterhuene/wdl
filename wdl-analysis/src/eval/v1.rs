@@ -438,7 +438,7 @@ impl WorkflowGraphNode {
     /// Gets the context of the name introduced by the node.
     ///
     /// Returns `None` if the node did not introduce a name.
-    fn context(&self) -> Option<NameContext> {
+    pub fn context(&self) -> Option<NameContext> {
         match self {
             Self::Input(decl) => Some(NameContext::Input(decl.name().span())),
             Self::Decl(decl) => Some(NameContext::Decl(decl.name().span())),
@@ -461,15 +461,15 @@ impl WorkflowGraphNode {
     }
 
     /// Gets the syntax node associated with the graph node.
-    fn syntax(&self) -> &SyntaxNode {
+    ///
+    /// Returns `None` for exit nodes.
+    pub fn syntax(&self) -> Option<&SyntaxNode> {
         match self {
-            Self::Input(decl) | Self::Decl(decl) | Self::Output(decl) => decl.syntax(),
-            Self::Conditional(statement) => statement.syntax(),
-            Self::Scatter(statement) => statement.syntax(),
-            Self::Call(statement) => statement.syntax(),
-            Self::ExitConditional(_) | Self::ExitScatter(_) => {
-                unreachable!("exit nodes have no syntax node")
-            }
+            Self::Input(decl) | Self::Decl(decl) | Self::Output(decl) => Some(decl.syntax()),
+            Self::Conditional(statement) => Some(statement.syntax()),
+            Self::Scatter(statement) => Some(statement.syntax()),
+            Self::Call(statement) => Some(statement.syntax()),
+            Self::ExitConditional(_) | Self::ExitScatter(_) => None,
         }
     }
 }
@@ -906,8 +906,14 @@ impl WorkflowGraphBuilder {
 
         let (from, to) = if let Some((f, t)) =
             self.ancestor_finder.find_children_of_common_ancestor(
-                graph[from].syntax().ancestors(),
-                graph[to].syntax().ancestors(),
+                graph[from]
+                    .syntax()
+                    .expect("should have syntax node")
+                    .ancestors(),
+                graph[to]
+                    .syntax()
+                    .expect("should have syntax node")
+                    .ancestors(),
                 SyntaxKind::WorkflowDefinitionNode,
             ) {
             let from = self

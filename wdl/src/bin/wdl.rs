@@ -48,6 +48,7 @@ use wdl_engine::EvaluationError;
 use wdl_engine::Inputs;
 use wdl_engine::local::LocalTaskExecutionBackend;
 use wdl_engine::v1::TaskEvaluator;
+use wdl_engine::v1::WorkflowEvaluator;
 use wdl_format::Formatter;
 use wdl_format::element::node::AstNodeFormatExt as _;
 
@@ -489,22 +490,27 @@ impl RunCommand {
                 bail!("document does not contain a task or workflow named `{name}`");
             }
         } else {
-            let mut iter = document.tasks();
-            let (name, inputs) = iter
-                .next()
-                .map(|t| (t.name().to_string(), Inputs::Task(Default::default())))
-                .or_else(|| {
-                    document
-                        .workflow()
-                        .map(|w| (w.name().to_string(), Inputs::Workflow(Default::default())))
-                })
-                .context(
-                    "inputs file is empty and the WDL document contains no tasks or workflow",
-                )?;
+            let (name, inputs) = document
+                .workflow()
+                .map(|w| Ok((w.name().to_string(), Inputs::Workflow(Default::default()))))
+                .unwrap_or_else(|| {
+                    let mut iter = document.tasks();
+                    let (name, inputs) = iter
+                        .next()
+                        .map(|t| (t.name().to_string(), Inputs::Task(Default::default())))
+                        .context(
+                            "inputs file is empty and the WDL document contains no tasks or \
+                             workflow",
+                        )?;
 
-            if iter.next().is_some() {
-                bail!("inputs file is empty and the WDL document contains more than one task");
-            }
+                    if iter.next().is_some() {
+                        bail!(
+                            "inputs file is empty and the WDL document contains more than one task"
+                        );
+                    }
+
+                    Ok((name, inputs))
+                })?;
 
             (None, name, inputs)
         };
@@ -606,7 +612,32 @@ impl RunCommand {
                     inputs.join_paths(engine.types_mut(), document, workflow, path);
                 }
 
-                bail!("running workflows is not yet supported")
+                let mut evaluator = WorkflowEvaluator::new(&mut engine);
+                match evaluator.evaluate(document, &inputs, &output_dir).await {
+                    Ok(outputs) => {
+                        // Buffer the entire output before writing it out in case there are
+                        // errors during serialization.
+                        let mut buffer = Vec::new();
+                        let mut serializer = serde_json::Serializer::pretty(&mut buffer);
+                        outputs.serialize(engine.types(), &mut serializer)?;
+                        println!(
+                            "{buffer}\n",
+                            buffer = std::str::from_utf8(&buffer).expect("output should be UTF-8")
+                        );
+                    }
+                    Err(e) => match e {
+                        EvaluationError::Source(diagnostic) => {
+                            emit_diagnostics(
+                                &self.file,
+                                &document.node().syntax().text().to_string(),
+                                &[diagnostic],
+                            )?;
+
+                            bail!("aborting due to workflow evaluation failure");
+                        }
+                        EvaluationError::Other(e) => return Err(e),
+                    },
+                }
             }
         }
 

@@ -474,6 +474,16 @@ impl Value {
         }
     }
 
+    /// Creates a clone of the value, but makes the type optional.
+    ///
+    /// This only affects compound values that internally store their type.
+    pub(crate) fn clone_as_optional(&self) -> Self {
+        match self {
+            Self::Compound(v) => Self::Compound(v.clone_as_optional()),
+            _ => self.clone(),
+        }
+    }
+
     /// Determines if two values have equality according to the WDL
     /// specification.
     ///
@@ -2318,6 +2328,31 @@ impl CompoundValue {
             Self::Object(_) => self.clone(),
             Self::Struct(v) => Self::Struct(Struct {
                 ty: v.ty.require(),
+                name: v.name.clone(),
+                members: v.members.clone(),
+            }),
+        }
+    }
+
+    /// Creates a clone of the value, but makes the type optional.
+    fn clone_as_optional(&self) -> Self {
+        match self {
+            Self::Pair(v) => Self::Pair(Pair {
+                ty: v.ty.optional(),
+                left: v.left.clone(),
+                right: v.right.clone(),
+            }),
+            Self::Array(v) => Self::Array(Array {
+                ty: v.ty.optional(),
+                elements: v.elements.clone(),
+            }),
+            Self::Map(v) => Self::Map(Map {
+                ty: v.ty.optional(),
+                elements: v.elements.clone(),
+            }),
+            Self::Object(_) => self.clone(),
+            Self::Struct(v) => Self::Struct(Struct {
+                ty: v.ty.optional(),
                 name: v.name.clone(),
                 members: v.members.clone(),
             }),

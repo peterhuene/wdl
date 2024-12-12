@@ -47,8 +47,6 @@ use super::Struct;
 use super::TASK_VAR_NAME;
 use super::Task;
 use super::Workflow;
-use super::braced_scope_span;
-use super::heredoc_scope_span;
 use crate::DiagnosticsConfig;
 use crate::UNUSED_CALL_RULE_ID;
 use crate::UNUSED_DECL_RULE_ID;
@@ -571,7 +569,12 @@ fn add_task(config: DiagnosticsConfig, document: &mut Document, definition: &Tas
     let mut task = Task {
         name_span: name.span(),
         name: name.as_str().to_string(),
-        scopes: vec![Scope::new(None, braced_scope_span(definition))],
+        scopes: vec![Scope::new(
+            None,
+            definition
+                .braced_scope_span()
+                .expect("should have brace scope span"),
+        )],
         inputs,
         outputs,
     };
@@ -645,9 +648,11 @@ fn add_task(config: DiagnosticsConfig, document: &mut Document, definition: &Tas
                         document.version(),
                         &mut task.scopes,
                         &name,
-                        braced_scope_span(
-                            &definition.output().expect("should have output section"),
-                        ),
+                        definition
+                            .output()
+                            .expect("should have output section")
+                            .braced_scope_span()
+                            .expect("should have braced scope span"),
                     )
                 });
                 add_decl(
@@ -661,12 +666,17 @@ fn add_task(config: DiagnosticsConfig, document: &mut Document, definition: &Tas
             TaskGraphNode::Command(section) => {
                 let scope_index = *command_scope.get_or_insert_with(|| {
                     let span = if section.is_heredoc() {
-                        heredoc_scope_span(&section)
+                        section.heredoc_scope_span()
                     } else {
-                        braced_scope_span(&section)
+                        section.braced_scope_span()
                     };
 
-                    create_section_scope(document.version(), &mut task.scopes, &name, span)
+                    create_section_scope(
+                        document.version(),
+                        &mut task.scopes,
+                        &name,
+                        span.expect("should have scope span"),
+                    )
                 });
 
                 let mut context = EvaluationContext::new(
@@ -821,7 +831,12 @@ fn populate_workflow(
     // Keep a map of scopes from syntax node that introduced the scope to the scope
     // index
     let mut scope_indexes: HashMap<SyntaxNode, ScopeIndex> = HashMap::new();
-    let mut scopes = vec![Scope::new(None, braced_scope_span(workflow))];
+    let mut scopes = vec![Scope::new(
+        None,
+        workflow
+            .braced_scope_span()
+            .expect("should have braced scope span"),
+    )];
     let mut output_scope = None;
     let graph = WorkflowGraphBuilder::default().build(workflow, &mut document.diagnostics);
 
@@ -896,9 +911,11 @@ fn populate_workflow(
                         &mut scopes,
                         Scope::new(
                             Some(ScopeIndex(0)),
-                            braced_scope_span(
-                                &workflow.output().expect("should have output section"),
-                            ),
+                            workflow
+                                .output()
+                                .expect("should have output section")
+                                .braced_scope_span()
+                                .expect("should have braced scope span"),
                         ),
                     )
                 });
@@ -1032,7 +1049,12 @@ fn add_conditional_statement(
 ) {
     let scope_index = add_scope(
         scopes,
-        Scope::new(Some(parent), braced_scope_span(statement)),
+        Scope::new(
+            Some(parent),
+            statement
+                .braced_scope_span()
+                .expect("should have braced scope span"),
+        ),
     );
     scope_indexes.insert(statement.syntax().clone(), scope_index);
 
@@ -1060,7 +1082,12 @@ fn add_scatter_statement(
 ) {
     let scope_index = add_scope(
         scopes,
-        Scope::new(Some(parent), braced_scope_span(statement)),
+        Scope::new(
+            Some(parent),
+            statement
+                .braced_scope_span()
+                .expect("should have braced scope span"),
+        ),
     );
     scopes_indexes.insert(statement.syntax().clone(), scope_index);
 
@@ -1304,8 +1331,8 @@ fn promote_scope(
     kind: PromotionKind,
 ) {
     // We need to split the scopes as we want to read from one part of the slice and
-    // write to another; the left side will contain the parent at it's index and the
-    // right side will contain the child scope at it's index minus the parent's
+    // write to another; the left side will contain the parent at its index and the
+    // right side will contain the child scope at its index minus the parent's
     let parent = scopes[index.0].parent.expect("should have a parent scope");
     assert!(index.0 > parent.0);
     let (left, right) = scopes.split_at_mut(parent.0 + 1);

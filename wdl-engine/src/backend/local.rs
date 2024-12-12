@@ -173,7 +173,7 @@ impl TaskExecution for LocalTaskExecution {
 
     fn spawn(
         &self,
-        command: String,
+        command: &str,
         _: &HashMap<String, Value>,
         _: &HashMap<String, Value>,
     ) -> Result<BoxFuture<'static, Result<i32>>> {
