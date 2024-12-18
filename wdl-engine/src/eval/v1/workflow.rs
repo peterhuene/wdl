@@ -6,6 +6,7 @@ use std::fs;
 use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anyhow::Context;
 use anyhow::anyhow;
@@ -13,6 +14,9 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use itertools::Itertools;
 use petgraph::Direction;
+use petgraph::graph::DiGraph;
+use petgraph::graph::NodeIndex;
+use petgraph::visit::Bfs;
 use petgraph::visit::EdgeRef;
 use tracing::debug;
 use tracing::info;
@@ -154,6 +158,11 @@ struct State<'a> {
     /// The first scope is always the root scope and the second scope is always
     /// the output scope.
     scopes: Vec<Scope>,
+    /// Indexes into `scopes` that are currently "free".
+    ///
+    /// This helps reduce memory usage by reusing scopes from scatter
+    /// statements.
+    free_scopes: Vec<usize>,
     /// The workflow evaluation working directory path.
     work_dir: PathBuf,
     /// The workflow evaluation temp directory path.
@@ -178,9 +187,549 @@ impl<'a> State<'a> {
             document,
             workflow,
             scopes: vec![Scope::new(None), Scope::new(Some(ROOT_SCOPE_INDEX))],
+            free_scopes: Default::default(),
             work_dir,
             temp_dir,
         })
+    }
+
+    /// Allocates a new scope and returns the scope index.
+    fn alloc_scope(&mut self, parent: Option<ScopeIndex>) -> ScopeIndex {
+        if let Some(index) = self.free_scopes.pop() {
+            if let Some(parent) = parent {
+                self.scopes[index].set_parent(parent);
+            }
+
+            return index.into();
+        }
+
+        let index = self.scopes.len();
+        self.scopes.push(Scope::new(parent));
+        index.into()
+    }
+
+    /// Frees a scope that is no longer used.
+    fn free_scope(&mut self, index: ScopeIndex) {
+        self.scopes[index.0].reset();
+        self.free_scopes.push(index.0);
+    }
+}
+
+/// Represents a subgraph of a workflow evaluation graph.
+///
+/// The subgraph stores relevant node indexes mapped to their current indegrees.
+#[derive(Debug, Clone)]
+struct Subgraph(HashMap<NodeIndex, usize>);
+
+impl Subgraph {
+    /// Constructs a new subgraph from the given graph.
+    ///
+    /// Initially, the subgraph will represent the entire graph, but will be
+    /// reduced as nodes are processed.
+    fn new_root(graph: &DiGraph<WorkflowGraphNode, ()>) -> Self {
+        let mut map = HashMap::with_capacity(graph.node_count());
+        for index in graph.node_indices() {
+            map.insert(
+                index,
+                graph.edges_directed(index, Direction::Incoming).count(),
+            );
+        }
+
+        Self(map)
+    }
+
+    /// Constructs a new subgraph for a scatter given the scatter's entry and
+    /// exit nodes.
+    ///
+    /// This works by "stealing" the nodes between the entry and exit nodes from
+    /// the parent subgraph.
+    ///
+    /// The exit node of the parent graph is reduced to an indegree of 1; only
+    /// the connection between the entry and exit node remains.
+    fn new_scatter(
+        graph: &DiGraph<WorkflowGraphNode, ()>,
+        parent: &mut HashMap<NodeIndex, usize>,
+        entry: NodeIndex,
+        exit: NodeIndex,
+    ) -> Self {
+        let mut map = HashMap::new();
+        let mut bfs = Bfs::new(graph, entry);
+        while let Some(node) = {
+            // Don't BFS into the exit node
+            if bfs.stack.front() == Some(&exit) {
+                bfs.stack.pop_front();
+            }
+            bfs.next(&graph)
+        } {
+            // Don't include the entry or exit nodes in the subgraph
+            if node == entry || node == exit {
+                continue;
+            }
+
+            // Steal the node from the parent subgraph
+            let prev = map.insert(
+                node,
+                parent.remove(&node).expect("node should exist in parent"),
+            );
+            assert!(prev.is_none());
+        }
+
+        // Decrement the indegree the nodes connected to the entry as we're not
+        // including it in the subgraph
+        for edge in graph.edges_directed(entry, Direction::Outgoing) {
+            if edge.target() != exit {
+                *map.get_mut(&edge.target()).expect("should be in subgraph") -= 1;
+            }
+        }
+
+        // Set the parent's exit node to an indegree of 1
+        *parent.get_mut(&exit).expect("should have exit node") = 1;
+
+        Self(map)
+    }
+
+    /// Creates subgraphs for each scatter node within this subgraph.
+    ///
+    /// The provided callback is called for every contained scatter subgraph.
+    ///
+    /// This subgraph is modified to replace any direct scatter subgraphs with
+    /// only the scatter entry and exit nodes.
+    fn scatter_subgraphs<F>(&mut self, graph: &DiGraph<WorkflowGraphNode, ()>, cb: &mut F)
+    where
+        F: FnMut(NodeIndex, Subgraph),
+    {
+        for index in graph.node_indices() {
+            if !self.0.contains_key(&index) {
+                continue;
+            }
+
+            if let WorkflowGraphNode::Scatter(_, exit) = &graph[index] {
+                let mut subgraph = Subgraph::new_scatter(graph, &mut self.0, index, *exit);
+                subgraph.scatter_subgraphs(graph, cb);
+                cb(index, subgraph);
+            }
+        }
+    }
+
+    /// Removes the given node from the subgraph.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the node's indegree is not 0.
+    fn remove_node(&mut self, graph: &DiGraph<WorkflowGraphNode, ()>, node: NodeIndex) {
+        let indegree = self.0.remove(&node);
+        assert_eq!(
+            indegree,
+            Some(0),
+            "removed a node with an indegree greater than 0"
+        );
+
+        // Decrement the indegrees of connected nodes
+        for edge in graph.edges_directed(node, Direction::Outgoing) {
+            *self
+                .0
+                .get_mut(&edge.target())
+                .expect("should have target node") -= 1;
+        }
+    }
+}
+
+/// Represents the state machine used for evaluating a workflow.
+///
+/// The state machine is responsible for processing evaluation graph nodes and
+/// awaiting calls.
+struct StateMachine<'a> {
+    /// The associated evaluation engine.
+    engine: &'a mut Engine,
+    /// The workflow evaluation graph.
+    graph: &'a DiGraph<WorkflowGraphNode, ()>,
+    /// The root subgraph.
+    ///
+    /// Initially, the root subgraph contains every node of the evaluation
+    /// graph.
+    ///
+    /// The scatter subgraphs are then split out from the root subgraph; only
+    /// the entry and exit nodes of the top-level scatters will remain.
+    root: Subgraph,
+    /// The map of scatter node entry indexes to the scatter subgraphs.
+    subgraphs: Arc<HashMap<NodeIndex, Subgraph>>,
+    /// The set of in-progress scatters.
+    scatters: Vec<Scatter>,
+    /// The list of free scatter slots.
+    free_scatters: Vec<usize>,
+}
+
+impl<'a> StateMachine<'a> {
+    fn new(engine: &'a mut Engine, graph: &'a DiGraph<WorkflowGraphNode, ()>) -> Self {
+        let mut root = Subgraph::new_root(graph);
+
+        // Create subgraphs for every scatter node in the graph
+        let mut subgraphs = HashMap::new();
+        root.scatter_subgraphs(graph, &mut |entry, subgraph| {
+            subgraphs.insert(entry, subgraph);
+        });
+
+        Self {
+            engine,
+            graph,
+            root,
+            subgraphs: Arc::new(subgraphs),
+            scatters: Default::default(),
+        }
+    }
+
+    /// Runs the state machine to completion.
+    async fn run(mut self, mut state: State<'a>, inputs: &WorkflowInputs) -> EvaluationResult<()> {
+        // Stores the in-progress calls
+        let mut calls = FuturesUnordered::new();
+        // The set of nodes being processed
+        let mut processing = Vec::new();
+        // The set of nodes being awaited on
+        let mut awaiting = HashSet::new();
+        // The set of in-progress scatters
+        let mut scatters: Vec<Scatter> = Vec::new();
+        // The scopes associated with an AST node
+        let mut scopes: HashMap<SyntaxNode, Vec<ScopeIndex>> = HashMap::new();
+
+        while !self.root.0.is_empty() {
+            // Add nodes with indegree 0 that we aren't already waiting on
+            // This is across the root subgraph as well as all in-progress scatter subgraphs
+            processing.extend(
+                self.root
+                    .0
+                    .iter()
+                    .filter_map(|(node, count)| {
+                        if *count == 0 && !awaiting.contains(node) {
+                            Some((None, *node))
+                        } else {
+                            None
+                        }
+                    })
+                    .chain(scatters.iter_mut().enumerate().flat_map(|(i, s)| {
+                        s.ready(
+                            &mut state,
+                            &awaiting,
+                            &scopes[&s.variable.syntax().parent().expect("should have parent")],
+                        )
+                        .map(move |node| (Some(i), node))
+                    })),
+            );
+
+            // If no graph nodes can be processed, await on calls
+            if processing.is_empty() {
+                let (scatter, index) = calls.next().await.expect("should have a future to wait on");
+                match &self.graph[index] {
+                    WorkflowGraphNode::Call(call) => {
+                        debug!(
+                            "call `{name}` has completed; removing from evaluation graph",
+                            name = call
+                                .alias()
+                                .map(|a| a.name())
+                                .unwrap_or_else(|| call.target().names().last().unwrap())
+                                .as_str()
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+
+                awaiting.remove(&index);
+                match scatter {
+                    Some(i) => {
+                        let scatter: &mut Scatter = &mut scatters[i];
+                        scatter.current.remove_node(self.graph, index);
+                        if scatter.completed() {
+                            awaiting.remove(&scatter.exit);
+                        }
+                    }
+                    None => self.root.remove_node(self.graph, index),
+                }
+
+                continue;
+            }
+
+            // Process the node now or push a future for later completion
+            for (scatter, node) in processing.iter().copied() {
+                match &self.graph[node] {
+                    WorkflowGraphNode::Input(decl) => {
+                        self.evaluate_input(&mut state, decl, inputs)?;
+                    }
+                    WorkflowGraphNode::Decl(decl) => {
+                        self.evaluate_decl(
+                            &mut state,
+                            scopes
+                                .get(&decl.syntax().parent().expect("should have parent"))
+                                .map(Vec::as_slice)
+                                .unwrap_or(&[ROOT_SCOPE_INDEX])
+                                .iter()
+                                .copied(),
+                            decl,
+                        )?;
+                    }
+                    WorkflowGraphNode::Output(decl) => {
+                        self.evaluate_output(&mut state, decl)?;
+                    }
+                    // WorkflowGraphNode::Conditional(stmt) => {
+                    //     self.evaluate_conditional(&mut state, &mut scope_indexes, stmt)?;
+                    // }
+                    WorkflowGraphNode::Scatter(stmt, exit) => {
+                        self.evaluate_scatter(&mut state, &mut scope_indexes, stmt)?;
+                    }
+                    WorkflowGraphNode::Call(call) => {
+                        calls.push(async move { (scatter, node) });
+                        awaiting.insert(node);
+                    }
+                    // WorkflowGraphNode::ExitConditional(stmt) => {
+                    //     self.evaluate_conditional_exit(&mut state, &mut scope_indexes, stmt)?
+                    // }
+                    // WorkflowGraphNode::ExitScatter(stmt) => {
+                    //     self.evaluate_scatter_exit(&mut state, &mut scope_indexes, stmt)?;
+                    // }
+                    _ => {}
+                }
+            }
+
+            // Remove nodes that have completed from the relevant subgraphs
+            for (scatter, node) in processing.drain(..) {
+                if awaiting.contains(&node) {
+                    continue;
+                }
+
+                match scatter {
+                    Some(i) => {
+                        let scatter = &mut scatters[i];
+                        scatter.current.remove_node(self.graph, node);
+                        if scatter.completed() {
+                            awaiting.remove(&scatter.exit);
+                        }
+                    }
+                    None => self.root.remove_node(self.graph, node),
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn alloc_scatter(&mut self) -> usize {
+        if let Some(index) = self.free_scatters.pop() {
+            return index;
+        }
+
+        let index = self.scatters.len();
+        self.scatters.push()
+    }
+
+    /// Evaluates a workflow input.
+    fn evaluate_input(
+        &mut self,
+        state: &mut State<'_>,
+        decl: &Decl,
+        inputs: &WorkflowInputs,
+    ) -> EvaluationResult<()> {
+        let name = decl.name();
+        let decl_ty = decl.ty();
+        let ty = self.engine.convert_ast_type_v1(state.document, &decl_ty)?;
+
+        let (value, span) = match inputs.get(name.as_str()) {
+            Some(input) => (input.clone(), name.span()),
+            None => {
+                if let Some(expr) = decl.expr() {
+                    debug!(
+                        "evaluating input `{name}` for workflow `{workflow}` in `{uri}`",
+                        name = name.as_str(),
+                        workflow = state.workflow.name(),
+                        uri = state.document.uri(),
+                    );
+
+                    let mut evaluator = ExprEvaluator::new(WorkflowEvaluationContext::new(
+                        self.engine,
+                        state,
+                        ROOT_SCOPE_INDEX,
+                    ));
+                    let value = evaluator.evaluate_expr(&expr)?;
+                    (value, expr.span())
+                } else {
+                    assert!(decl.ty().is_optional(), "type should be optional");
+                    (Value::None, name.span())
+                }
+            }
+        };
+
+        let value = value.coerce(self.engine.types_mut(), ty).map_err(|e| {
+            runtime_type_mismatch(self.engine.types(), e, ty, name.span(), value.ty(), span)
+        })?;
+
+        state.scopes[ROOT_SCOPE_INDEX.0].insert(name.as_str(), value);
+        Ok(())
+    }
+
+    /// Evaluates a workflow private declaration.
+    fn evaluate_decl(
+        &mut self,
+        state: &mut State<'_>,
+        scopes: impl Iterator<Item = ScopeIndex>,
+        decl: &Decl,
+    ) -> EvaluationResult<()> {
+        let name = decl.name();
+        debug!(
+            "evaluating private declaration `{name}` for workflow `{workflow}` in `{uri}`",
+            name = name.as_str(),
+            workflow = state.workflow.name(),
+            uri = state.document.uri(),
+        );
+
+        let decl_ty = decl.ty();
+        let ty = self.engine.convert_ast_type_v1(state.document, &decl_ty)?;
+
+        // Evaluate the declaration for every scope associated with the decl's parent
+        // node
+        for scope in scopes {
+            // Don't evaluate if a parent scope was introduced by a conditional statement
+            // that evaluated to false
+            if !ScopeRef::new(&state.scopes, scope)
+                .lookup(CONDITIONAL_VAR_NAME)
+                .and_then(|v| v.as_boolean())
+                .unwrap_or(true)
+            {
+                continue;
+            }
+
+            let mut evaluator =
+                ExprEvaluator::new(WorkflowEvaluationContext::new(self.engine, state, scope));
+
+            let expr = decl.expr().expect("private decls should have expressions");
+            let value = evaluator.evaluate_expr(&expr)?;
+            let value = value.coerce(self.engine.types_mut(), ty).map_err(|e| {
+                runtime_type_mismatch(
+                    self.engine.types(),
+                    e,
+                    ty,
+                    name.span(),
+                    value.ty(),
+                    expr.span(),
+                )
+            })?;
+
+            state.scopes[scope.0].insert(name.as_str(), value);
+        }
+
+        Ok(())
+    }
+
+    /// Evaluates a workflow output.
+    fn evaluate_output(&mut self, state: &mut State<'_>, decl: &Decl) -> EvaluationResult<()> {
+        let name = decl.name();
+        debug!(
+            "evaluating output `{name}` for workflow `{workflow}` in `{uri}`",
+            name = name.as_str(),
+            workflow = state.workflow.name(),
+            uri = state.document.uri()
+        );
+
+        let decl_ty = decl.ty();
+        let ty = self.engine.convert_ast_type_v1(state.document, &decl_ty)?;
+        let mut evaluator = ExprEvaluator::new(WorkflowEvaluationContext::new(
+            self.engine,
+            state,
+            OUTPUT_SCOPE_INDEX,
+        ));
+
+        let expr = decl.expr().expect("outputs should have expressions");
+        let value = evaluator.evaluate_expr(&expr)?;
+
+        // First coerce the output value to the expected type
+        let mut value = value.coerce(self.engine.types(), ty).map_err(|e| {
+            runtime_type_mismatch(
+                self.engine.types(),
+                e,
+                ty,
+                name.span(),
+                value.ty(),
+                expr.span(),
+            )
+        })?;
+
+        // Finally, join any paths with the working directory, checking for existence
+        value
+            .join_paths(self.engine.types(), &state.work_dir, true, ty.is_optional())
+            .map_err(|e| output_evaluation_failed(e, state.workflow.name(), false, &name))?;
+
+        state.scopes[OUTPUT_SCOPE_INDEX.0].insert(name.as_str(), value);
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct Scatter {
+    /// The original subgraph of the scatter.
+    subgraph: Arc<Subgraph>,
+    /// The graph node index for the scatter's exit node.
+    exit: NodeIndex,
+    /// The current subgraph of the scatter.
+    current: Subgraph,
+    /// The scatter variable identifier.
+    variable: Ident,
+    // The scatter array being iterated over.
+    array: Array,
+    /// The current starting offset into the scatter array.
+    offset: usize,
+}
+
+impl Scatter {
+    pub fn new(subgraph: Arc<Subgraph>, exit: NodeIndex, variable: Ident, array: Array) -> Self {
+        // let scopes: Vec<_> = (0..concurrency.min(array.len()))
+        //     .map(|_| state.alloc_scope(Some(parent)))
+        //     .collect();
+        let current = subgraph.as_ref().clone();
+
+        Self {
+            subgraph,
+            exit,
+            current,
+            variable,
+            array,
+            offset: 0,
+        }
+    }
+
+    /// Gets an iterator over the nodes in the scatter that are ready to
+    /// process.
+    fn ready<'a>(
+        &'a mut self,
+        state: &mut State<'_>,
+        awaiting: &'a HashSet<NodeIndex>,
+        scopes: &[ScopeIndex],
+    ) -> impl Iterator<Item = NodeIndex> + use<'a> {
+        // Check to see if the current subgraph has exhausted
+        if self.current.0.is_empty() && self.offset < self.array.len() {
+            // Extend the current subgraph from the original
+            self.current.0.extend(self.subgraph.0.iter());
+
+            // Clear the scopes and add back the scatter variable with the next value
+            for (i, scope) in scopes.iter().enumerate() {
+                state.scopes[scope.0].clear();
+
+                if let Some(v) = self.array.as_slice().get(self.offset + i) {
+                    state.scopes[scope.0].insert(self.variable.as_str(), v.clone());
+                }
+            }
+
+            // Adjust the offset
+            self.offset += scopes.len();
+        }
+
+        self.current.0.iter().filter_map(|(index, count)| {
+            if *count == 0 && !awaiting.contains(index) {
+                Some(*index)
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Determines if the scatter has completed.
+    fn completed(&self) -> bool {
+        self.current.0.is_empty() && self.offset >= self.array.len()
     }
 }
 
@@ -252,6 +801,8 @@ impl<'a> WorkflowEvaluator<'a> {
             workflow = workflow.name(),
             uri = document.uri()
         );
+
+        let sm = StateMachine::new(self.engine, &graph);
 
         // A map of syntax node to the scopes introduced by that node
         // Note that scatter statements may introduce multiple scopes (one per length of
@@ -344,7 +895,12 @@ impl<'a> WorkflowEvaluator<'a> {
                     WorkflowGraphNode::Conditional(stmt) => {
                         self.evaluate_conditional(&mut state, &mut scope_indexes, stmt)?;
                     }
-                    WorkflowGraphNode::Scatter(stmt) => {
+                    WorkflowGraphNode::Scatter(stmt, _) => {
+                        // For scatter statements, we split out a subgraph representing the scatter
+                        // This allows us to iterate over the subgraph for each element in the
+                        // scatter array We push the subgraph into the list
+                        // of graphs being evaluated so that we can attempt to make progress on any
+                        // of the graphs
                         self.evaluate_scatter(&mut state, &mut scope_indexes, stmt)?;
                     }
                     WorkflowGraphNode::Call(call) => {

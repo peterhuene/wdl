@@ -118,8 +118,6 @@ impl From<ScopeIndex> for usize {
 #[derive(Default, Debug)]
 pub struct Scope {
     /// The index of the parent scope.
-    ///
-    /// This is `None` for task and workflow scopes.
     parent: Option<ScopeIndex>,
     /// The map of names in scope to their values.
     names: IndexMap<String, Value>,
@@ -143,6 +141,22 @@ impl Scope {
     /// Gets a mutable reference to an existing name in scope.
     pub(crate) fn get_mut(&mut self, name: &str) -> Option<&mut Value> {
         self.names.get_mut(name)
+    }
+
+    /// Clears the names in the scope.
+    pub(crate) fn clear(&mut self) {
+        self.names.clear();
+    }
+
+    /// Resets the scope back to a default state.
+    pub(crate) fn reset(&mut self) {
+        self.parent = None;
+        self.names.clear();
+    }
+
+    /// Sets the scope's parent.
+    pub(crate) fn set_parent(&mut self, parent: ScopeIndex) {
+        self.parent = Some(parent);
     }
 }
 

@@ -941,7 +941,7 @@ fn populate_workflow(
                     &statement,
                 );
             }
-            WorkflowGraphNode::Scatter(statement) => {
+            WorkflowGraphNode::Scatter(statement, _) => {
                 let parent = scope_indexes
                     .get(&statement.syntax().parent().expect("should have parent"))
                     .copied()

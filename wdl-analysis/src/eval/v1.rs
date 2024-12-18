@@ -414,7 +414,7 @@ pub enum WorkflowGraphNode {
     /// The node is a conditional statement
     Conditional(ConditionalStatement),
     /// The node is a scatter statement.
-    Scatter(ScatterStatement),
+    Scatter(ScatterStatement, NodeIndex),
     /// The node is a call statement.
     Call(CallStatement),
     /// The node is an exit of a conditional statement.
@@ -443,7 +443,7 @@ impl WorkflowGraphNode {
             Self::Input(decl) => Some(NameContext::Input(decl.name().span())),
             Self::Decl(decl) => Some(NameContext::Decl(decl.name().span())),
             Self::Output(decl) => Some(NameContext::Output(decl.name().span())),
-            Self::Scatter(statement) => {
+            Self::Scatter(statement, _) => {
                 Some(NameContext::ScatterVariable(statement.variable().span()))
             }
             Self::Call(statement) => statement
@@ -467,7 +467,7 @@ impl WorkflowGraphNode {
         match self {
             Self::Input(decl) | Self::Decl(decl) | Self::Output(decl) => Some(decl.syntax()),
             Self::Conditional(statement) => Some(statement.syntax()),
-            Self::Scatter(statement) => Some(statement.syntax()),
+            Self::Scatter(statement, _) => Some(statement.syntax()),
             Self::Call(statement) => Some(statement.syntax()),
             Self::ExitConditional(_) | Self::ExitScatter(_) => None,
         }
@@ -480,7 +480,9 @@ impl fmt::Display for WorkflowGraphNode {
             Self::Input(decl) | Self::Decl(decl) | Self::Output(decl) => {
                 write!(f, "`{name}`", name = decl.name().as_str())
             }
-            Self::Scatter(statement) => write!(f, "`{name}`", name = statement.variable().as_str()),
+            Self::Scatter(statement, _) => {
+                write!(f, "`{name}`", name = statement.variable().as_str())
+            }
             Self::Call(statement) => write!(
                 f,
                 "`{name}`",
@@ -626,8 +628,8 @@ impl WorkflowGraphBuilder {
             WorkflowStatement::Scatter(statement) => {
                 // Create the entry and exit nodes for the scatter statement
                 // The exit node always depends on the entry node
-                let entry = graph.add_node(WorkflowGraphNode::Scatter(statement.clone()));
                 let exit = graph.add_node(WorkflowGraphNode::ExitScatter(statement.clone()));
+                let entry = graph.add_node(WorkflowGraphNode::Scatter(statement.clone(), exit));
                 graph.update_edge(entry, exit, ());
                 self.entry_exits
                     .insert(statement.syntax().clone(), (entry, exit));
@@ -772,7 +774,7 @@ impl WorkflowGraphBuilder {
                 WorkflowGraphNode::Conditional(statement) => {
                     self.add_expr_edges(from, statement.expr(), graph, diagnostics);
                 }
-                WorkflowGraphNode::Scatter(statement) => {
+                WorkflowGraphNode::Scatter(statement, _) => {
                     self.add_expr_edges(from, statement.expr(), graph, diagnostics);
                 }
                 WorkflowGraphNode::Call(statement) => {
