@@ -49,63 +49,52 @@ pub(crate) fn rewrite_url(url: &Url) -> Result<Url> {
 /// Returns `true` if the URL was for Google Cloud Storage or `false` if it was
 /// not.
 pub(crate) fn apply_auth(config: &GoogleStorageConfig, url: &mut Url) -> bool {
-    if let Some(url::Host::Domain(domain)) = url.host() {
-        if let Some(domain) = domain.strip_suffix(GOOGLE_STORAGE_DOMAIN) {
-            // If the URL already has a query string, don't modify it
-            if url.query().is_some() {
-                return true;
-            }
+    // Find the prefix of the domain; if empty, it indicates a path style URL
+    let prefix = match url.host().and_then(|host| match host {
+        url::Host::Domain(domain) => domain.strip_suffix(GOOGLE_STORAGE_DOMAIN),
+        _ => None,
+    }) {
+        Some(prefix) => prefix,
+        None => return false,
+    };
 
-            // There are two supported URL formats:
-            // 1) Path style e.g. `https://storage.googleapis.com/<bucket>/<object>`
-            // 2) Virtual-host style, e.g. `https://<bucket>.storage.googleapis.com/<object>`.
-            let bucket = if domain.is_empty() {
-                // This is a path style URL; bucket is first path segment
-                let mut segments = match url.path_segments() {
-                    Some(segments) => segments,
-                    None => return true,
-                };
+    // If the URL already has a query string, don't modify it
+    if url.query().is_some() {
+        return true;
+    }
 
-                match segments.next() {
-                    Some(bucket) => bucket,
-                    None => return true,
-                }
-            } else {
-                // This is a virtual-host style URL; bucket is first subdomain
-                let mut subdomains = domain.split('.');
-                let bucket = match subdomains.next() {
-                    Some(bucket) => bucket,
-                    None => return true,
-                };
+    // There are two supported URL formats:
+    // 1) Path style e.g. `https://storage.googleapis.com/<bucket>/<object>`
+    // 2) Virtual-host style, e.g. `https://<bucket>.storage.googleapis.com/<object>`.
+    let bucket = if prefix.is_empty() {
+        // This is a path style URL; bucket is first path segment
+        match url.path_segments().and_then(|mut segments| segments.next()) {
+            Some(bucket) => bucket,
+            None => return true,
+        }
+    } else {
+        // This is a virtual-host style URL; bucket should be followed with a single dot
+        let mut iter = prefix.split('.');
+        match (iter.next(), iter.next(), iter.next()) {
+            (Some(bucket), Some(""), None) => bucket,
+            _ => return true,
+        }
+    };
 
-                // Ensure there is nothing between the subdomain and the GCS domain
-                match subdomains.next() {
-                    Some("") => {}
-                    _ => return true,
-                }
-
-                bucket
-            };
-
-            if let Some(sig) = config.auth.get(bucket) {
-                // Warn if the scheme isn't https, as we won't be applying the auth.
-                if url.scheme() != "https" {
-                    warn!(
-                        "Google Cloud Storage URL `{url}` is not using HTTPS: authentication will \
-                         not be used"
-                    );
-                    return true;
-                }
-
-                let sig = sig.strip_prefix('?').unwrap_or(sig);
-                url.set_query(Some(sig));
-            }
-
-            return true;
+    if let Some(sig) = config.auth.get(bucket) {
+        if url.scheme() == "https" {
+            let sig = sig.strip_prefix('?').unwrap_or(sig);
+            url.set_query(Some(sig));
+        } else {
+            // Warn if the scheme isn't https, as we won't be applying the auth.
+            warn!(
+                "Google Cloud Storage URL `{url}` is not using HTTPS: authentication will not be \
+                 used"
+            );
         }
     }
 
-    false
+    true
 }
 
 #[cfg(test)]

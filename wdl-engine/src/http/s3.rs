@@ -7,8 +7,8 @@ use url::Url;
 
 use crate::config::S3StorageConfig;
 
-/// The S3 storage domain suffix.
-const S3_STORAGE_DOMAIN_SUFFIX: &str = ".amazonaws.com";
+/// The AWS domain suffix.
+const AWS_DOMAIN_SUFFIX: &str = ".amazonaws.com";
 
 /// The default S3 URL region.
 const DEFAULT_REGION: &str = "us-east-1";
@@ -25,24 +25,24 @@ pub(crate) fn rewrite_url(config: &S3StorageConfig, url: &Url) -> Result<Url> {
 
     match (url.query(), url.fragment()) {
         (None, None) => format!(
-            "https://{bucket}.s3.{region}{S3_STORAGE_DOMAIN_SUFFIX}{path}",
+            "https://{bucket}.s3.{region}{AWS_DOMAIN_SUFFIX}{path}",
             path = url.path()
         ),
         (None, Some(fragment)) => {
             format!(
-                "https://{bucket}.s3.{region}{S3_STORAGE_DOMAIN_SUFFIX}{path}#{fragment}",
+                "https://{bucket}.s3.{region}{AWS_DOMAIN_SUFFIX}{path}#{fragment}",
                 path = url.path()
             )
         }
         (Some(query), None) => {
             format!(
-                "https://{bucket}.s3.{region}{S3_STORAGE_DOMAIN_SUFFIX}{path}?{query}",
+                "https://{bucket}.s3.{region}{AWS_DOMAIN_SUFFIX}{path}?{query}",
                 path = url.path()
             )
         }
         (Some(query), Some(fragment)) => {
             format!(
-                "https://{bucket}.s3.{region}{S3_STORAGE_DOMAIN_SUFFIX}{path}?{query}#{fragment}",
+                "https://{bucket}.s3.{region}{AWS_DOMAIN_SUFFIX}{path}?{query}#{fragment}",
                 path = url.path()
             )
         }
@@ -55,65 +55,54 @@ pub(crate) fn rewrite_url(config: &S3StorageConfig, url: &Url) -> Result<Url> {
 ///
 /// Returns `true` if the URL was for S3 or `false` if it was not.
 pub(crate) fn apply_auth(config: &S3StorageConfig, url: &mut Url) -> bool {
-    if let Some(url::Host::Domain(domain)) = url.host() {
-        if let Some(domain) = domain.strip_suffix(S3_STORAGE_DOMAIN_SUFFIX) {
-            // If the URL already has a query string, don't modify it
-            if url.query().is_some() {
-                return true;
-            }
+    // Find the prefix of the domain
+    let prefix = match url.host().and_then(|host| match host {
+        url::Host::Domain(domain) => domain.strip_suffix(AWS_DOMAIN_SUFFIX),
+        _ => None,
+    }) {
+        Some(prefix) => prefix,
+        None => return false,
+    };
 
-            // There are three supported URL formats:
-            // 1) Path style without region, e.g. `https://s3.amazonaws.com/<bucket>/<object>`
-            // 2) Path style with region, e.g. `https://s3.<region>.amazonaws.com/<bucket>/<object>`.
-            // 3) Virtual-host style, e.g. `https://<bucket>.s3.<region>.amazonaws.com/<object>`.
-            let bucket = if domain == "s3"
-                || domain == "S3"
-                || domain.starts_with("s3.")
-                || domain.starts_with("S3.")
-            {
-                // This is a path style URL; bucket is first path segment
-                let mut segments = match url.path_segments() {
-                    Some(segments) => segments,
-                    None => return true,
-                };
+    // If the URL already has a query string, don't modify it
+    if url.query().is_some() {
+        return true;
+    }
 
-                match segments.next() {
-                    Some(bucket) => bucket,
-                    None => return true,
-                }
-            } else {
-                // This is a virtual-host style URL; bucket is first subdomain
-                let mut subdomains = domain.split('.');
-                let bucket = match subdomains.next() {
-                    Some(bucket) => bucket,
-                    None => return true,
-                };
+    // There are three supported URL formats:
+    // 1) Path style without region, e.g. `https://s3.amazonaws.com/<bucket>/<object>`
+    // 2) Path style with region, e.g. `https://s3.<region>.amazonaws.com/<bucket>/<object>`.
+    // 3) Virtual-host style, e.g. `https://<bucket>.s3.<region>.amazonaws.com/<object>`.
+    let bucket = if prefix == "s3"
+        || prefix == "S3"
+        || prefix.starts_with("s3.")
+        || prefix.starts_with("S3.")
+    {
+        // This is a path style URL; bucket is first path segment
+        match url.path_segments().and_then(|mut segments| segments.next()) {
+            Some(bucket) => bucket,
+            None => return true,
+        }
+    } else {
+        // This is a virtual-host style URL; bucket should be followed with `s3`.
+        let mut iter = prefix.split('.');
+        match (iter.next(), iter.next()) {
+            (Some(bucket), Some("s3")) | (Some(bucket), Some("S3")) => bucket,
+            _ => return true,
+        }
+    };
 
-                // Ensure the URL is for the S3 service
-                match subdomains.next() {
-                    Some("s3") | Some("S3") => {}
-                    _ => return true,
-                }
-
-                bucket
-            };
-
-            if let Some(sig) = config.auth.get(bucket) {
-                // Warn if the scheme isn't https, as we won't be applying the auth.
-                if url.scheme() != "https" {
-                    warn!("S3 URL `{url}` is not using HTTPS: authentication will not be used");
-                    return true;
-                }
-
-                let sig = sig.strip_prefix('?').unwrap_or(sig);
-                url.set_query(Some(sig));
-            }
-
-            return true;
+    if let Some(sig) = config.auth.get(bucket) {
+        if url.scheme() == "https" {
+            let sig = sig.strip_prefix('?').unwrap_or(sig);
+            url.set_query(Some(sig));
+        } else {
+            // Warn if the scheme isn't https, as we won't be applying the auth.
+            warn!("S3 URL `{url}` is not using HTTPS: authentication will not be used");
         }
     }
 
-    false
+    true
 }
 
 #[cfg(test)]

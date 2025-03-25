@@ -51,44 +51,52 @@ pub(crate) fn rewrite_url(url: &Url) -> Result<Url> {
 ///
 /// Returns `true` if the URL was for Azure or `false` if it was not.
 pub(crate) fn apply_auth(config: &AzureStorageConfig, url: &mut Url) -> bool {
-    if let Some(url::Host::Domain(domain)) = url.host() {
-        if let Some(account) = domain.strip_suffix(AZURE_STORAGE_DOMAIN_SUFFIX) {
-            // If the URL already has a query string, don't modify it
-            if url.query().is_some() {
-                return true;
-            }
+    // Attempt to extract the account from the domain
+    let account = match url.host().and_then(|host| match host {
+        url::Host::Domain(domain) => domain.strip_suffix(AZURE_STORAGE_DOMAIN_SUFFIX),
+        _ => None,
+    }) {
+        Some(account) => account,
+        None => return false,
+    };
 
-            if let Some(mut segments) = url.path_segments() {
-                // Determine the container name; if there's only one path segment, then use the
-                // root container name
-                let container = match (segments.next(), segments.next()) {
-                    (Some(_), None) => ROOT_CONTAINER_NAME,
-                    (Some(container), Some(_)) => container,
-                    _ => return true,
-                };
+    // If the URL already has a query string, don't modify it
+    if url.query().is_some() {
+        return true;
+    }
 
-                if let Some(containers) = config.auth.get(account) {
-                    if let Some(token) = containers.get(container) {
-                        // Warn if the scheme isn't https, as we won't be applying the auth.
-                        if url.scheme() != "https" {
-                            warn!(
-                                "Azure Blob Storage URL `{url}` is not using HTTPS: \
-                                 authentication will not be used"
-                            );
-                            return true;
-                        }
+    // Determine the container name; if there's only one path segment, then use the
+    // root container name
+    let container = match url.path_segments().and_then(|mut segments| {
+        match (segments.next(), segments.next()) {
+            (Some(_), None) => Some(ROOT_CONTAINER_NAME),
+            (Some(container), Some(_)) => Some(container),
+            _ => None,
+        }
+    }) {
+        Some(container) => container,
+        None => return true,
+    };
 
-                        let token = token.strip_prefix('?').unwrap_or(token);
-                        url.set_query(Some(token));
-                    }
-                }
-            }
-
-            return true;
+    // Apply the auth token if there is one
+    if let Some(token) = config
+        .auth
+        .get(account)
+        .and_then(|containers| containers.get(container))
+    {
+        if url.scheme() == "https" {
+            let token = token.strip_prefix('?').unwrap_or(token);
+            url.set_query(Some(token));
+        } else {
+            // Warn if the scheme isn't https, as we won't be applying the auth.
+            warn!(
+                "Azure Blob Storage URL `{url}` is not using HTTPS: authentication will not be \
+                 used"
+            );
         }
     }
 
-    false
+    true
 }
 
 #[cfg(test)]
