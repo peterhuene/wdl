@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use anyhow::Context;
 use anyhow::Error;
 use anyhow::Result;
+use anyhow::anyhow;
 use anyhow::bail;
 use futures::FutureExt;
 use futures::StreamExt;
@@ -46,13 +47,8 @@ const DEFAULT_CACHE_SUBDIR: &str = "wdl";
 pub trait Downloader {
     /// Downloads a file from a given URL.
     ///
-    /// Returns `Ok(None)` if the provided string is not a valid URL.
-    ///
-    /// Returns `Ok(Some)` if the file was downloaded successfully.
-    fn download<'a, 'b, 'c>(
-        &'a self,
-        url: &'b str,
-    ) -> BoxFuture<'c, Result<Option<Location>, Arc<Error>>>
+    /// Returns the location of the downloaded file.
+    fn download<'a, 'b, 'c>(&'a self, url: &'b Url) -> BoxFuture<'c, Result<Location, Arc<Error>>>
     where
         'a: 'c,
         'b: 'c,
@@ -228,58 +224,52 @@ impl HttpDownloader {
     }
 
     /// Applies authentication to the given URL.
-    fn apply_auth(&self, url: &mut Url) {
+    fn apply_auth<'a>(&self, url: &'a Url) -> Cow<'a, Url> {
         // Attempt to apply auth for Azure storage
-        if azure::apply_auth(&self.config.storage.azure, url) {
-            return;
+        if let Some(url) = azure::apply_auth(&self.config.storage.azure, url) {
+            return url;
         }
 
         // Attempt to apply auth for S3 storage
-        if s3::apply_auth(&self.config.storage.s3, url) {
-            return;
+        if let Some(url) = s3::apply_auth(&self.config.storage.s3, url) {
+            return url;
         }
 
         // Finally, attempt to apply auth for Google Cloud Storage
-        google::apply_auth(&self.config.storage.google, url);
+        if let Some(url) = google::apply_auth(&self.config.storage.google, url) {
+            return url;
+        }
+
+        Cow::Borrowed(url)
     }
 }
 
 impl Downloader for HttpDownloader {
-    fn download<'a, 'b, 'c>(
-        &'a self,
-        url: &'b str,
-    ) -> BoxFuture<'c, Result<Option<Location>, Arc<Error>>>
+    fn download<'a, 'b, 'c>(&'a self, url: &'b Url) -> BoxFuture<'c, Result<Location, Arc<Error>>>
     where
         'a: 'c,
         'b: 'c,
         Self: 'c,
     {
         async move {
-            // If the given string is not a URL, return `None`
-            let url: Url = match url.parse() {
-                Ok(url) => url,
-                Err(_) => return Ok(None),
-            };
-
-            let mut url = match url.scheme() {
+            let url: Cow<'_, Url> = match url.scheme() {
                 "file" => {
-                    // If it can be converted to a path, return the path; otherwise `None`
-                    return Ok(match url.to_file_path() {
-                        Ok(p) => Some(Location::Path(p)),
-                        Err(_) => None,
-                    });
+                    return Ok(Location::Path(
+                        url.to_file_path()
+                            .map_err(|_| anyhow!("invalid file URL `{url}`"))?,
+                    ));
                 }
-                "http" | "https" => url,
-                "az" => azure::rewrite_url(&url)?,
-                "s3" => s3::rewrite_url(&self.config.storage.s3, &url)?,
-                "gs" => google::rewrite_url(&url)?,
-                _ => return Ok(None),
+                "http" | "https" => Cow::Borrowed(url),
+                "az" => Cow::Owned(azure::rewrite_url(&url)?),
+                "s3" => Cow::Owned(s3::rewrite_url(&self.config.storage.s3, &url)?),
+                "gs" => Cow::Owned(google::rewrite_url(&url)?),
+                _ => return Err(anyhow!("cannot download unsupported URL `{url}`").into()),
             };
 
             // TODO: support downloading "directories" for cloud storage URLs
 
             // Apply any authentication to the URL based on configuration
-            self.apply_auth(&mut url);
+            let url = self.apply_auth(&url);
 
             // This loop exists so that all requests to download the same URL will block
             // waiting for a notification that the download has completed.
@@ -299,7 +289,7 @@ impl Downloader for HttpDownloader {
                             notify.clone()
                         }
                         Some(Status::Downloaded(r)) => {
-                            return r.clone().map(Into::into);
+                            return r.clone();
                         }
                         None => {
                             assert!(
@@ -308,7 +298,10 @@ impl Downloader for HttpDownloader {
                             );
 
                             // Insert an entry and break out of the loop to download
-                            downloads.insert(url.clone(), Status::Downloading(Arc::default()));
+                            downloads.insert(
+                                url.clone().into_owned(),
+                                Status::Downloading(Arc::default()),
+                            );
                             break;
                         }
                     }
@@ -333,7 +326,7 @@ impl Downloader for HttpDownloader {
             };
 
             notify.notify_waiters();
-            res.map(Some)
+            res
         }
         .boxed()
     }

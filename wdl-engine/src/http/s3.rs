@@ -1,5 +1,7 @@
 //! Implementation of support for Amazon AWS S3 URLs.
 
+use std::borrow::Cow;
+
 use anyhow::Context;
 use anyhow::Result;
 use tracing::warn;
@@ -54,19 +56,19 @@ pub(crate) fn rewrite_url(config: &S3StorageConfig, url: &Url) -> Result<Url> {
 /// Applies S3 presigned signatures to the given URL.
 ///
 /// Returns `true` if the URL was for S3 or `false` if it was not.
-pub(crate) fn apply_auth(config: &S3StorageConfig, url: &mut Url) -> bool {
+pub(crate) fn apply_auth<'a>(config: &S3StorageConfig, url: &'a Url) -> Option<Cow<'a, Url>> {
     // Find the prefix of the domain
     let prefix = match url.host().and_then(|host| match host {
         url::Host::Domain(domain) => domain.strip_suffix(AWS_DOMAIN_SUFFIX),
         _ => None,
     }) {
         Some(prefix) => prefix,
-        None => return false,
+        None => return None,
     };
 
     // If the URL already has a query string, don't modify it
     if url.query().is_some() {
-        return true;
+        return Some(Cow::Borrowed(url));
     }
 
     // There are three supported URL formats:
@@ -81,28 +83,30 @@ pub(crate) fn apply_auth(config: &S3StorageConfig, url: &mut Url) -> bool {
         // This is a path style URL; bucket is first path segment
         match url.path_segments().and_then(|mut segments| segments.next()) {
             Some(bucket) => bucket,
-            None => return true,
+            None => return Some(Cow::Borrowed(url)),
         }
     } else {
         // This is a virtual-host style URL; bucket should be followed with `s3`.
         let mut iter = prefix.split('.');
         match (iter.next(), iter.next()) {
             (Some(bucket), Some("s3")) | (Some(bucket), Some("S3")) => bucket,
-            _ => return true,
+            _ => return Some(Cow::Borrowed(url)),
         }
     };
 
     if let Some(sig) = config.auth.get(bucket) {
         if url.scheme() == "https" {
             let sig = sig.strip_prefix('?').unwrap_or(sig);
+            let mut url = url.clone();
             url.set_query(Some(sig));
+            return Some(Cow::Owned(url));
         } else {
             // Warn if the scheme isn't https, as we won't be applying the auth.
             warn!("S3 URL `{url}` is not using HTTPS: authentication will not be used");
         }
     }
 
-    true
+    Some(Cow::Borrowed(url))
 }
 
 #[cfg(test)]
@@ -161,101 +165,99 @@ mod test {
 
         // Not an S3 URL
         let mut url = "https://example.com/bar/baz".parse().unwrap();
-        assert!(!apply_auth(&config, &mut url));
+        assert!(apply_auth(&config, &mut url).is_none());
         assert_eq!(url.as_str(), "https://example.com/bar/baz");
 
         // Not using HTTPS
-        let mut url = "http://s3.us-east-1.amazonaws.com/bucket1/bar"
+        let url = "http://s3.us-east-1.amazonaws.com/bucket1/bar"
             .parse()
             .unwrap();
-        assert!(apply_auth(&config, &mut url));
         assert_eq!(
-            url.as_str(),
+            apply_auth(&config, &url).unwrap().as_str(),
             "http://s3.us-east-1.amazonaws.com/bucket1/bar"
         );
 
         // Unknown bucket (path without region)
-        let mut url = "https://s3.amazonaws.com/foo/bar".parse().unwrap();
-        assert!(apply_auth(&config, &mut url));
-        assert_eq!(url.as_str(), "https://s3.amazonaws.com/foo/bar");
+        let url = "https://s3.amazonaws.com/foo/bar".parse().unwrap();
+        assert_eq!(
+            apply_auth(&config, &url).unwrap().as_str(),
+            "https://s3.amazonaws.com/foo/bar"
+        );
 
         // Unknown bucket (path with region)
-        let mut url = "https://s3.us-east-1.amazonaws.com/foo/bar"
+        let url = "https://s3.us-east-1.amazonaws.com/foo/bar"
             .parse()
             .unwrap();
-        assert!(apply_auth(&config, &mut url));
-        assert_eq!(url.as_str(), "https://s3.us-east-1.amazonaws.com/foo/bar");
+        assert_eq!(
+            apply_auth(&config, &url).unwrap().as_str(),
+            "https://s3.us-east-1.amazonaws.com/foo/bar"
+        );
 
         // Unknown bucket (vhost)
-        let mut url = "https://foo.s3.us-east-1.amazonaws.com/bar"
+        let url = "https://foo.s3.us-east-1.amazonaws.com/bar"
             .parse()
             .unwrap();
-        assert!(apply_auth(&config, &mut url));
-        assert_eq!(url.as_str(), "https://foo.s3.us-east-1.amazonaws.com/bar");
+        assert_eq!(
+            apply_auth(&config, &url).unwrap().as_str(),
+            "https://foo.s3.us-east-1.amazonaws.com/bar"
+        );
 
         // Matching with first token (path without region)
-        let mut url = "https://s3.amazonaws.com/bucket1/bar".parse().unwrap();
-        assert!(apply_auth(&config, &mut url));
+        let url = "https://s3.amazonaws.com/bucket1/bar".parse().unwrap();
         assert_eq!(
-            url.as_str(),
+            apply_auth(&config, &url).unwrap().as_str(),
             "https://s3.amazonaws.com/bucket1/bar?token1=foo"
         );
 
         // Matching with first token(path with region)
-        let mut url = "https://s3.us-east-1.amazonaws.com/bucket1/bar"
+        let url = "https://s3.us-east-1.amazonaws.com/bucket1/bar"
             .parse()
             .unwrap();
-        assert!(apply_auth(&config, &mut url));
         assert_eq!(
-            url.as_str(),
+            apply_auth(&config, &url).unwrap().as_str(),
             "https://s3.us-east-1.amazonaws.com/bucket1/bar?token1=foo"
         );
 
         // Matching with first token (vhost)
-        let mut url = "https://bucket1.s3.us-east-1.amazonaws.com/bar"
+        let url = "https://bucket1.s3.us-east-1.amazonaws.com/bar"
             .parse()
             .unwrap();
-        assert!(apply_auth(&config, &mut url));
         assert_eq!(
-            url.as_str(),
+            apply_auth(&config, &url).unwrap().as_str(),
             "https://bucket1.s3.us-east-1.amazonaws.com/bar?token1=foo"
         );
 
         // Matching with second token (path without region)
-        let mut url = "https://s3.amazonaws.com/bucket2/bar".parse().unwrap();
-        assert!(apply_auth(&config, &mut url));
+        let url = "https://s3.amazonaws.com/bucket2/bar".parse().unwrap();
         assert_eq!(
-            url.as_str(),
+            apply_auth(&config, &url).unwrap().as_str(),
             "https://s3.amazonaws.com/bucket2/bar?token2=bar"
         );
 
         // Matching with second token(path with region)
-        let mut url = "https://s3.us-east-1.amazonaws.com/bucket2/bar"
+        let url = "https://s3.us-east-1.amazonaws.com/bucket2/bar"
             .parse()
             .unwrap();
-        assert!(apply_auth(&config, &mut url));
         assert_eq!(
-            url.as_str(),
+            apply_auth(&config, &url).unwrap().as_str(),
             "https://s3.us-east-1.amazonaws.com/bucket2/bar?token2=bar"
         );
 
         // Matching with second token (vhost)
-        let mut url = "https://bucket2.s3.us-east-1.amazonaws.com/bar"
+        let url = "https://bucket2.s3.us-east-1.amazonaws.com/bar"
             .parse()
             .unwrap();
-        assert!(apply_auth(&config, &mut url));
         assert_eq!(
-            url.as_str(),
+            apply_auth(&config, &url).unwrap().as_str(),
             "https://bucket2.s3.us-east-1.amazonaws.com/bar?token2=bar"
         );
 
         // Matching with query params already present
-        let mut url = "https://bucket2.s3.us-east-1.amazonaws.com/bar?a=b"
+        let url = "https://bucket2.s3.us-east-1.amazonaws.com/bar?a=b"
             .parse()
             .unwrap();
-        assert!(apply_auth(&config, &mut url));
         assert_eq!(
-            url.as_str(),
+            apply_auth(&config, &url).unwrap().as_str(),
             "https://bucket2.s3.us-east-1.amazonaws.com/bar?a=b"
         );
     }

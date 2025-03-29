@@ -2,7 +2,6 @@
 
 use std::path::Path;
 
-use url::Url;
 use wdl_analysis::stdlib::STDLIB as ANALYSIS_STDLIB;
 use wdl_analysis::types::PrimitiveType;
 use wdl_ast::Diagnostic;
@@ -15,6 +14,7 @@ use crate::Array;
 use crate::PrimitiveValue;
 use crate::Value;
 use crate::diagnostics::function_call_failed;
+use crate::parse_url;
 
 /// The name of the function defined in this file for use in diagnostics.
 const FUNCTION_NAME: &str = "glob";
@@ -31,33 +31,24 @@ fn glob(context: CallContext<'_>) -> Result<Value, Diagnostic> {
         .coerce_argument(0, PrimitiveType::String)
         .unwrap_string();
 
-    // Do not attempt to parse absolute Windows paths (and by extension, we do not
-    // support single-character schemed URLs)
-    let path = if path.get(1..2) != Some(":") {
-        // Prevent glob of non-file URLs
-        if let Ok(url) = path.parse::<Url>() {
-            if url.scheme() != "file" {
+    let path = if let Some(url) = parse_url(&path) {
+        if url.scheme() != "file" {
+            return Err(function_call_failed(
+                FUNCTION_NAME,
+                format!("path `{path}` cannot be globbed: only `file` scheme URLs are supported"),
+                context.call_site,
+            ));
+        }
+
+        match url.to_file_path() {
+            Ok(path) => path,
+            Err(_) => {
                 return Err(function_call_failed(
                     FUNCTION_NAME,
-                    format!(
-                        "path `{path}` cannot be globbed: only `file` scheme URLs are supported"
-                    ),
+                    format!("path `{path}` cannot be represented as a local file path"),
                     context.call_site,
                 ));
             }
-
-            match url.to_file_path() {
-                Ok(path) => path,
-                Err(_) => {
-                    return Err(function_call_failed(
-                        FUNCTION_NAME,
-                        format!("path `{path}` cannot be represented as a local file path"),
-                        context.call_site,
-                    ));
-                }
-            }
-        } else {
-            context.work_dir().join(path.as_str())
         }
     } else {
         context.work_dir().join(path.as_str())

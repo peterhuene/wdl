@@ -19,6 +19,7 @@ use super::Function;
 use super::Signature;
 use crate::Value;
 use crate::diagnostics::function_call_failed;
+use crate::parse_url;
 
 /// The name of the function defined in this file for use in diagnostics.
 const FUNCTION_NAME: &str = "read_json";
@@ -36,28 +37,33 @@ fn read_json(context: CallContext<'_>) -> BoxFuture<'_, Result<Value, Diagnostic
             .coerce_argument(0, PrimitiveType::File)
             .unwrap_file();
 
-        let location = context
-            .context
-            .downloader()
-            .download(&path)
-            .await
-            .map_err(|e| {
-                function_call_failed(
-                    FUNCTION_NAME,
-                    format!("failed to download file `{path}`: {e:?}"),
-                    context.call_site,
-                )
-            })?;
+        let location = if let Some(url) = parse_url(&path) {
+            context
+                .context
+                .downloader()
+                .download(&url)
+                .await
+                .map(Some)
+                .map_err(|e| {
+                    function_call_failed(
+                        FUNCTION_NAME,
+                        format!("failed to download file `{path}`: {e:?}"),
+                        context.call_site,
+                    )
+                })?
+        } else {
+            None
+        };
 
-        let cache_path: Cow<'_, Path> = location
+        let file_path: Cow<'_, Path> = location
             .as_deref()
             .map(Into::into)
             .unwrap_or_else(|| context.work_dir().join(path.as_str()).into());
 
         // Note: `serde-json` does not support asynchronous readers, so we are
         // performing a synchronous read here
-        let file = fs::File::open(&cache_path)
-            .with_context(|| format!("failed to open file `{path}`", path = cache_path.display()))
+        let file = fs::File::open(&file_path)
+            .with_context(|| format!("failed to open file `{path}`", path = file_path.display()))
             .map_err(|e| {
                 function_call_failed(FUNCTION_NAME, format!("{e:?}"), context.call_site)
             })?;

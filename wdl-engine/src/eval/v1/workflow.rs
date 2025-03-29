@@ -72,6 +72,7 @@ use crate::ScopeIndex;
 use crate::ScopeRef;
 use crate::TaskExecutionBackend;
 use crate::Value;
+use crate::WORK_DIR_NAME;
 use crate::WorkflowInputs;
 use crate::config::Config;
 use crate::diagnostics::call_failed;
@@ -198,7 +199,7 @@ impl EvaluationContext for WorkflowEvaluationContext<'_, '_> {
         None
     }
 
-    fn translate_path(&self, _path: &Path) -> Option<Cow<'_, Path>> {
+    fn translate_path(&self, _path: &str) -> Option<Cow<'_, Path>> {
         None
     }
 
@@ -774,7 +775,7 @@ impl WorkflowEvaluator {
             .concurrency
             .unwrap_or_else(|| self.backend.max_concurrency());
 
-        let work_dir = root_dir.join("work");
+        let work_dir = root_dir.join(WORK_DIR_NAME);
 
         // Create the temp directory now as it may be needed for workflow evaluation
         let temp_dir = root_dir.join("tmp");
@@ -1186,8 +1187,9 @@ impl WorkflowEvaluator {
 
         // Finally, join any paths with the working directory, checking for existence
         value
-            .join_paths(&state.work_dir, true, expected_ty.is_optional(), &|_| {
-                Ok(None)
+            .visit_paths_mut(expected_ty.is_optional(), &mut |optional, value| {
+                value.join_path_to(&state.work_dir);
+                value.ensure_path_exists(optional)
             })
             .map_err(|e| {
                 output_evaluation_failed(

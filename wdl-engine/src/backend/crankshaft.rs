@@ -24,18 +24,24 @@ use nonempty::NonEmpty;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use url::Url;
 
 use super::TaskExecutionBackend;
 use super::TaskExecutionConstraints;
+use super::TaskExecutionEvents;
+use super::TaskExecutionResult;
 use super::TaskManager;
 use super::TaskManagerRequest;
 use super::TaskSpawnRequest;
+use crate::MountAccess;
 use crate::ONE_GIBIBYTE;
 use crate::Value;
+use crate::WORK_DIR_NAME;
 use crate::config::CrankshaftBackendConfig;
 use crate::config::CrankshaftBackendKind;
 use crate::config::DEFAULT_TASK_SHELL;
 use crate::config::TaskConfig;
+use crate::http::Downloader;
 use crate::v1::container;
 use crate::v1::cpu;
 use crate::v1::max_cpu;
@@ -48,11 +54,19 @@ use crate::v1::memory;
 /// prepopulated into the name generator.
 const INITIAL_EXPECTED_NAMES: usize = 1000;
 
+/// The root guest path for inputs.
+const GUEST_INPUTS_DIR: &str = "/mnt/inputs";
+
+/// The guest working directory.
+const GUEST_WORK_DIR: &str = "/mnt/work";
+
+/// The guest path for the command file.
+const GUEST_COMMAND_PATH: &str = "/mnt/command";
+
 /// Represents a crankshaft task request.
 ///
 /// This request contains the requested cpu and memory reservations for the task
 /// as well as the result receiver channel.
-#[derive(Debug)]
 struct CrankshaftTaskRequest {
     /// The inner task spawn request.
     inner: TaskSpawnRequest,
@@ -85,10 +99,11 @@ impl TaskManagerRequest for CrankshaftTaskRequest {
         self.memory
     }
 
-    async fn run(self, spawned: oneshot::Sender<()>) -> Result<i32> {
+    async fn run(self, spawned: oneshot::Sender<()>) -> Result<TaskExecutionResult> {
         // Create the working directory
-        let work_dir = self.inner.root.work_dir();
-        fs::create_dir_all(work_dir).with_context(|| {
+        // TODO: this should only be done for local task execution
+        let work_dir = self.inner.root.attempt_dir().join(WORK_DIR_NAME);
+        fs::create_dir_all(&work_dir).with_context(|| {
             format!(
                 "failed to create directory `{path}`",
                 path = work_dir.display()
@@ -96,6 +111,7 @@ impl TaskManagerRequest for CrankshaftTaskRequest {
         })?;
 
         // Write the evaluated command to disk
+        // This is done even for remote execution so that a copy exists locally
         let command_path = self.inner.root.command();
         fs::write(command_path, &self.inner.command).with_context(|| {
             format!(
@@ -104,31 +120,68 @@ impl TaskManagerRequest for CrankshaftTaskRequest {
             )
         })?;
 
-        let inputs = self
-            .inner
-            .mounts
-            .iter()
-            .filter(|m| m.host.exists())
-            .map(|m| {
-                Ok(Arc::new(
+        let mut inputs = Vec::with_capacity(self.inner.mounts.len() + 2);
+        for mount in self.inner.mounts.iter() {
+            // TODO: we should only download for local Crankshaft backends; otherwise, we
+            // should pass the URLs directly
+            let location = self
+                .inner
+                .downloader
+                .download(&mount.host)
+                .await
+                .map_err(|e| {
+                    anyhow!(
+                        "failed to localize `{host}` for task execution: {e:?}",
+                        host = mount.host
+                    )
+                })?;
+            if location.exists() {
+                inputs.push(Arc::new(
                     Input::builder()
                         .path(
-                            m.guest
+                            mount
+                                .guest
                                 .as_os_str()
                                 .to_str()
                                 .context("task input path is not UTF-8")?,
                         )
-                        .contents(Contents::Path(m.host.clone()))
-                        .ty(if m.host.is_dir() {
+                        .contents(Contents::Path(location.to_path_buf()))
+                        .ty(if location.is_dir() {
                             Type::Directory
                         } else {
                             Type::File
                         })
-                        .read_only(m.read_only)
+                        .read_only(match mount.access {
+                            MountAccess::ReadOnly => true,
+                            MountAccess::ReadWrite => false,
+                        })
                         .build(),
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
+                ));
+            }
+        }
+
+        // Add an input for the work directory
+        // TODO: we should not do this for remote backends
+        inputs.push(Arc::new(
+            Input::builder()
+                .path(GUEST_WORK_DIR)
+                .contents(Contents::Path(work_dir.to_path_buf()))
+                .ty(Type::Directory)
+                .read_only(false)
+                .build(),
+        ));
+
+        // Add an input for the command
+        inputs.push(Arc::new(
+            Input::builder()
+                .path(GUEST_COMMAND_PATH)
+                .contents(Contents::Path(command_path.to_path_buf()))
+                .ty(Type::File)
+                .read_only(true)
+                .build(),
+        ));
+
+        // TODO: for remote backends, add an output for the working directory
 
         let task = Task::builder()
             .name(self.name)
@@ -141,26 +194,8 @@ impl TaskManagerRequest for CrankshaftTaskRequest {
                             .map(|s| s.as_str())
                             .unwrap_or(DEFAULT_TASK_SHELL),
                     )
-                    .args([
-                        "-C".to_string(),
-                        self.inner
-                            .mounts
-                            .guest(command_path)
-                            .expect("should have guest path")
-                            .as_os_str()
-                            .to_str()
-                            .context("command path is not UTF-8")?
-                            .to_string(),
-                    ])
-                    .work_dir(
-                        self.inner
-                            .mounts
-                            .guest(work_dir)
-                            .expect("should have guest path")
-                            .as_os_str()
-                            .to_str()
-                            .context("working directory path is not UTF-8")?,
-                    )
+                    .args(["-C".to_string(), GUEST_COMMAND_PATH.to_string()])
+                    .work_dir(GUEST_WORK_DIR)
                     .env(self.inner.env.as_ref().clone())
                     .build(),
             ))
@@ -199,7 +234,12 @@ impl TaskManagerRequest for CrankshaftTaskRequest {
                 path = self.inner.root.stderr().display()
             )
         })?;
-        Ok(output.status.code().expect("should have exit code"))
+        Ok(TaskExecutionResult {
+            exit_code: output.status.code().expect("should have exit code"),
+            // TODO: fix this for remote task execution
+            work_dir: Url::from_file_path(work_dir)
+                .expect("working directory path should be absolute"),
+        })
     }
 }
 
@@ -318,15 +358,19 @@ impl TaskExecutionBackend for CrankshaftBackend {
         })
     }
 
-    fn container_root_dir(&self) -> Option<&Path> {
-        Some(Path::new("/mnt/task"))
+    fn guest_inputs_dir(&self) -> Option<&Path> {
+        Some(Path::new(GUEST_INPUTS_DIR))
+    }
+
+    fn guest_work_dir(&self) -> Option<&Path> {
+        Some(Path::new(GUEST_WORK_DIR))
     }
 
     fn spawn(
         &self,
         request: TaskSpawnRequest,
         token: CancellationToken,
-    ) -> Result<(oneshot::Receiver<()>, oneshot::Receiver<Result<i32>>)> {
+    ) -> Result<TaskExecutionEvents> {
         let (spawned_tx, spawned_rx) = oneshot::channel();
         let (completed_tx, completed_rx) = oneshot::channel();
 
@@ -363,6 +407,9 @@ impl TaskExecutionBackend for CrankshaftBackend {
             completed_tx,
         );
 
-        Ok((spawned_rx, completed_rx))
+        Ok(TaskExecutionEvents {
+            spawned: spawned_rx,
+            completed: completed_rx,
+        })
     }
 }

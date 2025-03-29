@@ -23,12 +23,17 @@ use tokio::sync::oneshot::Receiver;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::debug;
+use url::Url;
 
 use crate::Mounts;
 use crate::Value;
+use crate::http::HttpDownloader;
 
 pub mod crankshaft;
 pub mod local;
+
+/// The default work directory name.
+pub const WORK_DIR_NAME: &str = "work";
 
 /// Represents constraints applied to a task's execution.
 pub struct TaskExecutionConstraints {
@@ -68,21 +73,21 @@ pub struct TaskExecutionConstraints {
 
 /// Represents the root directory of a task execution.
 ///
-/// The directory layout for task execution is:
+/// The directory layout for local task execution is:
 ///
 /// ```text
 /// <root>/
-/// ├─ tmp/             # Where files are created by the stdlib before/after the command evaluation
+/// ├─ tmp/             # Where files are created by the stdlib for task evaluation
 /// ├─ attempt/         # Stores the execution attempts
-/// │  ├─ 0/            # First attempt
+/// │  ├─ 0/            # First attempt root directory
 /// │  │  ├─ work/      # Working directory for the task's first execution
-/// │  │  ├─ tmp/       # Where files are created by the stdlib during command evaluation
 /// │  │  ├─ command    # The evaluated command for the first execution
 /// │  │  ├─ stdout     # The standard output of the first execution
 /// │  │  ├─ stderr     # The standard error of the first execution
 /// │  ├─ 1/            # Second attempt (first retry)
 /// │  │  ├─ ...
-/// ```
+///
+/// Note that for remote task execution, the working directory will not be created.
 #[derive(Debug)]
 pub struct TaskExecutionRoot {
     /// The root directory for task execution.
@@ -90,14 +95,8 @@ pub struct TaskExecutionRoot {
     /// The path to the directory for files created by the stdlib before and
     /// after command evaluation.
     temp_dir: PathBuf,
-    /// The path to the directory for files created by the stdlib during command
-    /// evaluation.
-    ///
-    /// This needs to be a different location from `temp_dir` because commands
-    /// are re-evaluated on retry.
-    attempt_temp_dir: PathBuf,
-    /// The path to the working directory for the execution.
-    work_dir: PathBuf,
+    /// The root directory for the attempt.
+    attempt_dir: PathBuf,
     /// The path to the command file.
     command: PathBuf,
     /// The path to the stdout file.
@@ -116,8 +115,8 @@ impl TaskExecutionRoot {
             )
         })?;
 
-        let mut attempts = root_dir.join("attempts");
-        attempts.push(attempt.to_string());
+        let mut attempt_dir = root_dir.join("attempts");
+        attempt_dir.push(attempt.to_string());
 
         // Create both temp directories now as it may be needed for task evaluation
         let temp_dir = root_dir.join("tmp");
@@ -128,22 +127,17 @@ impl TaskExecutionRoot {
             )
         })?;
 
-        let attempt_temp_dir = attempts.join("tmp");
-        fs::create_dir_all(&attempt_temp_dir).with_context(|| {
-            format!(
-                "failed to create directory `{path}`",
-                path = attempt_temp_dir.display()
-            )
-        })?;
+        let command = attempt_dir.join("command");
+        let stdout = attempt_dir.join("stdout");
+        let stderr = attempt_dir.join("stderr");
 
         Ok(Self {
             root_dir,
             temp_dir,
-            attempt_temp_dir,
-            work_dir: attempts.join("work"),
-            command: attempts.join("command"),
-            stdout: attempts.join("stdout"),
-            stderr: attempts.join("stderr"),
+            attempt_dir,
+            command,
+            stdout,
+            stderr,
         })
     }
 
@@ -161,26 +155,12 @@ impl TaskExecutionRoot {
         &self.temp_dir
     }
 
-    /// Gets the temporary directory path for the current task attempt.
-    ///
-    /// This is the location for storing files created during evaluation of the
-    /// command.
-    ///
-    /// The temporary directory is created before spawning the task so that it
-    /// is available for task evaluation.
-    pub fn attempt_temp_dir(&self) -> &Path {
-        &self.attempt_temp_dir
+    /// Gets the attempt directory.
+    pub fn attempt_dir(&self) -> &Path {
+        &self.attempt_dir
     }
 
-    /// Gets the working directory for task execution.
-    ///
-    /// The working directory will be created upon spawning the task.
-    pub fn work_dir(&self) -> &Path {
-        &self.work_dir
-    }
-
-    //// Gets the command file path.
-    /// The command file is created upon spawning the task.
+    /// Gets the command file path.
     pub fn command(&self) -> &Path {
         &self.command
     }
@@ -201,7 +181,6 @@ impl TaskExecutionRoot {
 }
 
 /// Represents a request to spawn a task.
-#[derive(Debug)]
 pub struct TaskSpawnRequest {
     /// The execution root of the task.
     root: Arc<TaskExecutionRoot>,
@@ -215,8 +194,10 @@ pub struct TaskSpawnRequest {
     hints: Arc<HashMap<String, Value>>,
     /// The environment variables of the task.
     env: Arc<IndexMap<String, String>>,
-    /// The mounts to use for the spawn request.
+    /// The input mounts to use for the spawn request.
     mounts: Arc<Mounts>,
+    /// The downloader to use for accessing remote files.
+    downloader: HttpDownloader,
 }
 
 impl TaskSpawnRequest {
@@ -232,6 +213,7 @@ impl TaskSpawnRequest {
         hints: Arc<HashMap<String, Value>>,
         env: Arc<IndexMap<String, String>>,
         mounts: Arc<Mounts>,
+        downloader: HttpDownloader,
     ) -> Self {
         Self {
             root,
@@ -241,6 +223,7 @@ impl TaskSpawnRequest {
             hints,
             env,
             mounts,
+            downloader,
         }
     }
 
@@ -280,6 +263,27 @@ impl TaskSpawnRequest {
     }
 }
 
+/// Represents the result of a task's execution.
+#[derive(Debug)]
+pub struct TaskExecutionResult {
+    /// Stores the task process exit code.
+    pub exit_code: i32,
+    /// The task's working directory.
+    ///
+    /// Represents as a URL to support remote working directories.
+    pub work_dir: Url,
+}
+
+/// Represents events that can be awaited on during task execution.
+pub struct TaskExecutionEvents {
+    /// The event for when the task has spawned and is currently executing.
+    pub spawned: Receiver<()>,
+    /// The event for when the task has completed.
+    ///
+    /// Returns the execution result.
+    pub completed: Receiver<Result<TaskExecutionResult>>,
+}
+
 /// Represents a task execution backend.
 pub trait TaskExecutionBackend: Send + Sync {
     /// Gets the maximum concurrent tasks supported by the backend.
@@ -295,21 +299,24 @@ pub trait TaskExecutionBackend: Send + Sync {
         hints: &HashMap<String, Value>,
     ) -> Result<TaskExecutionConstraints>;
 
-    /// Gets the container (guest) root directory for the backend (e.g.
-    /// `/mnt/task`).
+    /// Gets the guest path for inputs to the task (e.g. `/mnt/inputs`).
     ///
     /// Returns `None` if the task execution does not use a container.
-    fn container_root_dir(&self) -> Option<&Path>;
+    fn guest_inputs_dir(&self) -> Option<&Path>;
+
+    /// Gets the guest path the task working directory (e.g. `/mnt/work`).
+    ///
+    /// Returns `None` if the task execution does not use a container.
+    fn guest_work_dir(&self) -> Option<&Path>;
 
     /// Spawns a task with the execution backend.
     ///
-    /// Upon success, returns two receivers: one that will receive a message
-    /// when the task is spawned and another when the task has completed.
+    /// Returns the task execution event receives upon success.
     fn spawn(
         &self,
         request: TaskSpawnRequest,
         token: CancellationToken,
-    ) -> Result<(Receiver<()>, Receiver<Result<i32>>)>;
+    ) -> Result<TaskExecutionEvents>;
 }
 
 /// A trait implemented by backend requests.
@@ -321,9 +328,10 @@ trait TaskManagerRequest: Send + Sync + 'static {
     fn memory(&self) -> u64;
 
     /// Runs the request.
-    ///
-    /// The return value is the exit code of the task's process.
-    fn run(self, spawned: oneshot::Sender<()>) -> impl Future<Output = Result<i32>> + Send;
+    fn run(
+        self,
+        spawned: oneshot::Sender<()>,
+    ) -> impl Future<Output = Result<TaskExecutionResult>> + Send;
 }
 
 /// Represents a response internal to the task manager.
@@ -333,9 +341,9 @@ struct TaskManagerResponse {
     /// The previous memory allocation from the request.
     memory: u64,
     /// The result of the task's execution.
-    result: Result<i32>,
+    result: Result<TaskExecutionResult>,
     /// The channel to send the task's execution result back on.
-    tx: oneshot::Sender<Result<i32>>,
+    tx: oneshot::Sender<Result<TaskExecutionResult>>,
 }
 
 /// Represents state used by the task manager.
@@ -347,7 +355,11 @@ struct TaskManagerState<Req> {
     /// The set of spawned tasks.
     spawned: JoinSet<TaskManagerResponse>,
     /// The queue of parked spawn requests.
-    parked: VecDeque<(Req, oneshot::Sender<()>, oneshot::Sender<Result<i32>>)>,
+    parked: VecDeque<(
+        Req,
+        oneshot::Sender<()>,
+        oneshot::Sender<Result<TaskExecutionResult>>,
+    )>,
 }
 
 impl<Req> TaskManagerState<Req> {
@@ -370,7 +382,11 @@ impl<Req> TaskManagerState<Req> {
 /// Responsible for managing tasks based on available host resources.
 struct TaskManager<Req> {
     /// The sender for new spawn requests.
-    tx: mpsc::UnboundedSender<(Req, oneshot::Sender<()>, oneshot::Sender<Result<i32>>)>,
+    tx: mpsc::UnboundedSender<(
+        Req,
+        oneshot::Sender<()>,
+        oneshot::Sender<Result<TaskExecutionResult>>,
+    )>,
 }
 
 impl<Req> TaskManager<Req>
@@ -400,14 +416,18 @@ where
         &self,
         request: Req,
         spawned: oneshot::Sender<()>,
-        completed: oneshot::Sender<Result<i32>>,
+        completed: oneshot::Sender<Result<TaskExecutionResult>>,
     ) {
         self.tx.send((request, spawned, completed)).ok();
     }
 
     /// Runs the request queue.
     async fn run_request_queue(
-        mut rx: mpsc::UnboundedReceiver<(Req, oneshot::Sender<()>, oneshot::Sender<Result<i32>>)>,
+        mut rx: mpsc::UnboundedReceiver<(
+            Req,
+            oneshot::Sender<()>,
+            oneshot::Sender<Result<TaskExecutionResult>>,
+        )>,
         cpu: u64,
         max_cpu: u64,
         memory: u64,
@@ -464,7 +484,7 @@ where
         max_memory: u64,
         request: Req,
         spawned: oneshot::Sender<()>,
-        completed: oneshot::Sender<Result<i32>>,
+        completed: oneshot::Sender<Result<TaskExecutionResult>>,
     ) {
         // Ensure the request does not exceed the maximum CPU
         let cpu = request.cpu();

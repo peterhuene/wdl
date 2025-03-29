@@ -21,6 +21,7 @@ use crate::Map;
 use crate::PrimitiveValue;
 use crate::Value;
 use crate::diagnostics::function_call_failed;
+use crate::parse_url;
 
 /// The name of the function defined in this file for use in diagnostics.
 const FUNCTION_NAME: &str = "read_map";
@@ -48,20 +49,24 @@ fn read_map(context: CallContext<'_>) -> BoxFuture<'_, Result<Value, Diagnostic>
             .coerce_argument(0, PrimitiveType::File)
             .unwrap_file();
 
-        let location = context
-            .context
-            .downloader()
-            .download(&path)
-            .await
-            .map_err(|e| {
-                function_call_failed(
-                    FUNCTION_NAME,
-                    format!("failed to download file `{path}`: {e:?}"),
-                    context.call_site,
-                )
-            })?;
-
-        let cache_path: Cow<'_, Path> = location
+        let location = if let Some(url) = parse_url(&path) {
+            context
+                .context
+                .downloader()
+                .download(&url)
+                .await
+                .map(Some)
+                .map_err(|e| {
+                    function_call_failed(
+                        FUNCTION_NAME,
+                        format!("failed to download file `{path}`: {e:?}"),
+                        context.call_site,
+                    )
+                })?
+        } else {
+            None
+        };
+        let file_path: Cow<'_, Path> = location
             .as_deref()
             .map(Into::into)
             .unwrap_or_else(|| context.work_dir().join(path.as_str()).into());
@@ -71,13 +76,13 @@ fn read_map(context: CallContext<'_>) -> BoxFuture<'_, Result<Value, Diagnostic>
                 FUNCTION_NAME,
                 format!(
                     "failed to read file `{path}`: {e}",
-                    path = cache_path.display()
+                    path = file_path.display()
                 ),
                 context.call_site,
             )
         };
 
-        let file = fs::File::open(&cache_path).await.map_err(read_error)?;
+        let file = fs::File::open(&file_path).await.map_err(read_error)?;
 
         let mut i = 1;
         let mut lines = BufReader::new(file).lines();

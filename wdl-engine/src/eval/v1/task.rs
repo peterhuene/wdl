@@ -10,6 +10,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
+use anyhow::bail;
 use indexmap::IndexMap;
 use path_clean::clean;
 use petgraph::algo::toposort;
@@ -19,6 +20,7 @@ use tracing::debug;
 use tracing::enabled;
 use tracing::info;
 use tracing::warn;
+use url::Url;
 use wdl_analysis::diagnostics::multiple_type_mismatch;
 use wdl_analysis::diagnostics::unknown_name;
 use wdl_analysis::document::Document;
@@ -62,8 +64,9 @@ use super::ProgressKind;
 use crate::Coercible;
 use crate::EvaluationContext;
 use crate::EvaluationResult;
+use crate::MountAccess;
 use crate::Outputs;
-use crate::PathTrie;
+use crate::PrimitiveValue;
 use crate::Scope;
 use crate::ScopeIndex;
 use crate::ScopeRef;
@@ -72,6 +75,7 @@ use crate::TaskExecutionRoot;
 use crate::TaskInputs;
 use crate::TaskSpawnRequest;
 use crate::TaskValue;
+use crate::UrlTrie;
 use crate::Value;
 use crate::config::Config;
 use crate::config::MAX_RETRIES;
@@ -82,6 +86,9 @@ use crate::eval::EvaluatedTask;
 use crate::eval::Mounts;
 use crate::http::Downloader;
 use crate::http::HttpDownloader;
+use crate::is_file_url;
+use crate::is_url;
+use crate::parse_url;
 use crate::tree::SyntaxNode;
 use crate::v1::ExprEvaluator;
 
@@ -221,10 +228,6 @@ struct TaskEvaluationContext<'a, 'b> {
     downloader: &'a HttpDownloader,
     /// The current evaluation scope.
     scope: ScopeIndex,
-    /// The working directory to use for evaluation.
-    work_dir: &'a Path,
-    /// The temp directory to use for evaluation.
-    temp_dir: &'a Path,
     /// The standard out value to use.
     stdout: Option<&'a Value>,
     /// The standard error value to use.
@@ -239,19 +242,12 @@ struct TaskEvaluationContext<'a, 'b> {
 
 impl<'a, 'b> TaskEvaluationContext<'a, 'b> {
     /// Constructs a new expression evaluation context.
-    pub fn new(
-        state: &'a State<'b>,
-        downloader: &'a HttpDownloader,
-        temp_dir: &'a Path,
-        scope: ScopeIndex,
-    ) -> Self {
+    pub fn new(state: &'a State<'b>, downloader: &'a HttpDownloader, scope: ScopeIndex) -> Self {
         Self {
             state,
             downloader,
             scope,
-            work_dir: state.root.work_dir(),
             stdout: None,
-            temp_dir,
             stderr: None,
             mounts: None,
             task: false,
@@ -305,11 +301,11 @@ impl EvaluationContext for TaskEvaluationContext<'_, '_> {
     }
 
     fn work_dir(&self) -> &Path {
-        self.work_dir
+        self.state.root.work_dir()
     }
 
     fn temp_dir(&self) -> &Path {
-        self.temp_dir
+        self.state.root.temp_dir()
     }
 
     fn stdout(&self) -> Option<&Value> {
@@ -328,7 +324,7 @@ impl EvaluationContext for TaskEvaluationContext<'_, '_> {
         }
     }
 
-    fn translate_path(&self, path: &Path) -> Option<Cow<'_, Path>> {
+    fn translate_path(&self, path: &str) -> Option<Cow<'_, Path>> {
         self.mounts.and_then(|m| m.guest(path))
     }
 
@@ -652,9 +648,10 @@ impl TaskEvaluator {
                 hints.clone(),
                 env.clone(),
                 mounts.clone(),
+                self.downloader.clone(),
             );
 
-            let (spawned_rx, completed_rx) = self
+            let events = self
                 .backend
                 .spawn(request, self.token.clone())
                 .with_context(|| {
@@ -666,20 +663,21 @@ impl TaskEvaluator {
                 })?;
 
             // Await the spawned notification first
-            spawned_rx.await.ok();
+            events.spawned.await.ok();
 
             progress(ProgressKind::TaskExecutionStarted { id, attempt });
 
-            let status_code = completed_rx
+            let result = events
+                .completed
                 .await
                 .expect("failed to receive response from spawned task");
 
             progress(ProgressKind::TaskExecutionCompleted {
                 id,
-                status_code: &status_code,
+                result: &result,
             });
 
-            let status_code = status_code.with_context(|| {
+            let result = result.with_context(|| {
                 format!(
                     "task execution failed for task `{name}` in `{path}` (task id `{id}`)",
                     name = task.name(),
@@ -688,7 +686,7 @@ impl TaskEvaluator {
             })?;
 
             // Update the task variable
-            let evaluated = EvaluatedTask::new(&state.root, status_code)?;
+            let evaluated = EvaluatedTask::new(&state.root, result)?;
             if version >= SupportedVersion::V1(V1::Two) {
                 let task = state.scopes[TASK_SCOPE_INDEX.0]
                     .get_mut(TASK_VAR_NAME)
@@ -702,7 +700,7 @@ impl TaskEvaluator {
                         task = state.task.name()
                     )
                 })?);
-                task.set_return_code(evaluated.status_code);
+                task.set_return_code(evaluated.exit_code);
             }
 
             if let Err(e) = evaluated.handle_exit(&requirements) {
@@ -751,6 +749,7 @@ impl TaskEvaluator {
 
         // Take the output scope and return it
         let mut outputs: Outputs = mem::take(&mut state.scopes[OUTPUT_SCOPE_INDEX.0]).into();
+        drop(state);
         if let Some(section) = definition.output() {
             let indexes: HashMap<_, _> = section
                 .declarations()
@@ -791,7 +790,6 @@ impl TaskEvaluator {
                     let mut evaluator = ExprEvaluator::new(TaskEvaluationContext::new(
                         state,
                         &self.downloader,
-                        state.root.temp_dir(),
                         ROOT_SCOPE_INDEX,
                     ));
                     let value = evaluator.evaluate_expr(&expr).await?;
@@ -846,7 +844,6 @@ impl TaskEvaluator {
         let mut evaluator = ExprEvaluator::new(TaskEvaluationContext::new(
             state,
             &self.downloader,
-            state.root.temp_dir(),
             ROOT_SCOPE_INDEX,
         ));
 
@@ -914,7 +911,6 @@ impl TaskEvaluator {
             let mut evaluator = ExprEvaluator::new(TaskEvaluationContext::new(
                 state,
                 &self.downloader,
-                state.root.temp_dir(),
                 ROOT_SCOPE_INDEX,
             ));
 
@@ -979,7 +975,6 @@ impl TaskEvaluator {
             let mut evaluator = ExprEvaluator::new(TaskEvaluationContext::new(
                 state,
                 &self.downloader,
-                state.root.temp_dir(),
                 ROOT_SCOPE_INDEX,
             ));
 
@@ -1027,13 +1022,7 @@ impl TaskEvaluator {
             }
 
             let mut evaluator = ExprEvaluator::new(
-                TaskEvaluationContext::new(
-                    state,
-                    &self.downloader,
-                    state.root.temp_dir(),
-                    ROOT_SCOPE_INDEX,
-                )
-                .with_task(),
+                TaskEvaluationContext::new(state, &self.downloader, ROOT_SCOPE_INDEX).with_task(),
             );
 
             let value = evaluator.evaluate_hints_item(&name, &item.expr()).await?;
@@ -1061,41 +1050,74 @@ impl TaskEvaluator {
         );
 
         // Determine the mounts needed to evaluate the command properly
-        let mounts = match self.backend.container_root_dir() {
-            Some(root_dir) => {
+        let mounts = match self.backend.guest_inputs_dir() {
+            Some(inputs_dir) => {
                 // For every file or directory value in scope, we need to insert into the tree
-                let mut paths = Vec::new();
+                let mut urls = Vec::new();
 
-                // Discover every path and directory that's visible to the scope
+                // Discover every path and directory that's visible to the scope and convert the
+                // paths to URLs
                 ScopeRef::new(&state.scopes, TASK_SCOPE_INDEX.0).for_each(|_, v| {
-                    v.visit_paths(&mut |p| {
-                        paths.push((clean(state.root.work_dir().join(p.as_ref())), true));
-                    });
-                });
+                    v.visit_paths(false, &mut |_, value| {
+                        match value {
+                            PrimitiveValue::File(path) => {
+                                let url = parse_url(path)
+                                    .or_else(|| {
+                                        let path = clean(state.root.work_dir().join(path.as_str()));
+                                        Url::from_file_path(path).ok()
+                                    })
+                                    .with_context(|| format!("invalid file path `{path}`"))?;
+                                urls.push(url);
+                            }
+                            PrimitiveValue::Directory(path) => {
+                                let url = parse_url(path)
+                                    .or_else(|| {
+                                        let path = clean(state.root.work_dir().join(path.as_str()));
+                                        Url::from_file_path(path).ok()
+                                    })
+                                    .with_context(|| format!("invalid directory path `{path}`"))?;
+
+                                // Currently we can't mount a directory that isn't from the local
+                                // file system In the future, we
+                                // should integrate with specific cloud storage SDKs
+                                if url.scheme() != "file" {
+                                    bail!(
+                                        "currently only `file` scheme URLs are supported for \
+                                         directories"
+                                    );
+                                }
+
+                                urls.push(url);
+                            }
+                            _ => unreachable!(
+                                "only files and directories should be given to the callback"
+                            ),
+                        }
+
+                        Ok(())
+                    })
+                })?;
 
                 // Insert the paths into the trie
-                let mut trie = PathTrie::default();
-                for (path, read_only) in &paths {
-                    trie.insert(path, *read_only);
+                let mut trie = UrlTrie::default();
+                for url in &urls {
+                    trie.insert(url, MountAccess::ReadOnly);
                 }
 
-                trie.insert(state.root.work_dir(), false);
-                trie.insert(state.root.temp_dir(), true);
-                trie.insert(state.root.attempt_temp_dir(), true);
-                trie.insert(state.root.command(), true);
+                trie.insert(state.root.temp_dir(), MountAccess::ReadOnly);
 
                 // Convert the trie into mounts
-                let mounts = trie.into_mounts(root_dir.join("inputs"));
+                let mounts = trie.into_mounts(inputs_dir);
                 if enabled!(Level::DEBUG) {
                     for mount in mounts.iter() {
                         debug!(
                             task_id = id,
                             task_name = state.task.name(),
                             document = state.document.uri().as_str(),
-                            "mounting `{host}` as `{guest}`{ro}",
-                            host = mount.host.display(),
+                            "mounting `{host}` as `{guest}` ({access})",
+                            host = mount.host,
                             guest = mount.guest.display(),
-                            ro = if mount.read_only { " (read-only)" } else { "" }
+                            access = mount.access
                         );
                     }
                 }
@@ -1109,13 +1131,8 @@ impl TaskEvaluator {
         match section.strip_whitespace() {
             Some(parts) => {
                 let mut evaluator = ExprEvaluator::new(
-                    TaskEvaluationContext::new(
-                        state,
-                        &self.downloader,
-                        state.root.attempt_temp_dir(),
-                        TASK_SCOPE_INDEX,
-                    )
-                    .with_mounts(&mounts),
+                    TaskEvaluationContext::new(state, &self.downloader, TASK_SCOPE_INDEX)
+                        .with_mounts(&mounts),
                 );
 
                 for part in parts {
@@ -1140,13 +1157,8 @@ impl TaskEvaluator {
                 );
 
                 let mut evaluator = ExprEvaluator::new(
-                    TaskEvaluationContext::new(
-                        state,
-                        &self.downloader,
-                        state.root.attempt_temp_dir(),
-                        TASK_SCOPE_INDEX,
-                    )
-                    .with_mounts(&mounts),
+                    TaskEvaluationContext::new(state, &self.downloader, TASK_SCOPE_INDEX)
+                        .with_mounts(&mounts),
                 );
 
                 let heredoc = section.is_heredoc();
@@ -1280,14 +1292,9 @@ impl TaskEvaluator {
         let decl_ty = decl.ty();
         let ty = crate::convert_ast_type_v1(state.document, &decl_ty)?;
         let mut evaluator = ExprEvaluator::new(
-            TaskEvaluationContext::new(
-                state,
-                &self.downloader,
-                state.root.temp_dir(),
-                TASK_SCOPE_INDEX,
-            )
-            .with_stdout(&evaluated.stdout)
-            .with_stderr(&evaluated.stderr),
+            TaskEvaluationContext::new(state, &self.downloader, TASK_SCOPE_INDEX)
+                .with_stdout(&evaluated.stdout)
+                .with_stderr(&evaluated.stderr),
         );
 
         let expr = decl.expr().expect("outputs should have expressions");
@@ -1298,27 +1305,88 @@ impl TaskEvaluator {
             .coerce(&ty)
             .map_err(|e| runtime_type_mismatch(e, &ty, name.span(), &value.ty(), expr.span()))?;
 
-        // Finally, join the path with the working directory, checking for existence
-        value
-            .join_paths(&evaluated.work_dir, true, ty.is_optional(), &|p| {
-                let host = mounts.host(p);
+        let r = if let Some(guest_work_dir) = self.backend.guest_work_dir() {
+            // Perform guest to host path translation and check for existence
+            value.visit_paths_mut(ty.is_optional(), &mut |optional, value| {
+                let path = match value {
+                    PrimitiveValue::File(path) => path,
+                    PrimitiveValue::Directory(path) => path,
+                    _ => unreachable!("only file and directory values should be visited"),
+                };
 
-                // If the path was absolute, it must map to a host path otherwise the file
-                // exists only within the container
-                if p.is_absolute() && !p.starts_with(state.root.path()) {
-                    return Ok(Some(host.ok_or_else(|| {
-                        anyhow!(
-                            "guest path `{p}` is not within a container mount",
-                            p = p.display()
-                        )
-                    })?));
+                // It's a file scheme'd URL, treat it as an absolute guest path
+                let guest = if is_file_url(path) {
+                    parse_url(&path)
+                        .and_then(|u| u.to_file_path().ok())
+                        .ok_or_else(|| anyhow!("guest path `{path}` is not a valid file URI"))?
+                } else if is_url(path) {
+                    // Treat other URLs as if they exist
+                    // TODO: should probably issue a HEAD request to verify
+                    return Ok(true);
+                } else {
+                    // Otherwise, treat as relative to the guest working directory
+                    guest_work_dir.join(path.as_str())
+                };
+
+                // If the path is inside of the working directory, join with the task's working
+                // directory
+                let host = if let Ok(stripped) = guest.strip_prefix(guest_work_dir) {
+                    let mut url = evaluated.work_dir.clone();
+
+                    // For consistency with `PathBuf::push`, push an empty segment so that we treat
+                    // the last segment as a directory; otherwise, `Url::join` will treat it as a
+                    // file.
+                    if let Ok(mut segments) = url.path_segments_mut() {
+                        segments.pop_if_empty();
+                        segments.push("");
+                    }
+
+                    Cow::Owned(
+                        evaluated
+                            .work_dir
+                            .join(stripped.to_str().with_context(|| {
+                                format!(
+                                    "output path `{path}` contains characters that are not UTF-8"
+                                )
+                            })?)
+                            .with_context(|| {
+                                format!(
+                                    "output path `{path}` cannot be joined with working directory"
+                                )
+                            })?,
+                    )
+                } else {
+                    mounts.host(&guest).ok_or_else(|| {
+                        anyhow!("guest path `{path}` is not within a container mount")
+                    })?
+                };
+
+                // Update the value to the host path
+                if host.scheme() == "file" {
+                    *Arc::make_mut(path) = host
+                        .to_file_path()
+                        .ok()
+                        .and_then(|p| p.into_os_string().into_string().ok())
+                        .unwrap_or_else(|| host.into_owned().into());
+                } else {
+                    *Arc::make_mut(path) = host.into_owned().into();
                 }
 
-                Ok(host)
+                // Finally, ensure the value exists
+                value.ensure_path_exists(optional)
             })
-            .map_err(|e| {
-                output_evaluation_failed(e, state.task.name(), true, name.text(), name.span())
-            })?;
+        } else {
+            // Backend isn't containerized, just join host paths and check for existence
+            assert!(evaluated.work_dir.scheme() == "file");
+            value.visit_paths_mut(ty.is_optional(), &mut |optional, value| {
+                value.join_path_to(&evaluated.work_dir);
+                value.ensure_path_exists(optional)
+            })
+        };
+
+        r.map_err(|e| {
+            output_evaluation_failed(e, state.task.name(), true, name.text(), name.span())
+        })?;
 
         state.scopes[OUTPUT_SCOPE_INDEX.0].insert(name.text(), value);
         Ok(())

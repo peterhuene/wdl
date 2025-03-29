@@ -16,15 +16,19 @@ use tokio::select;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
+use url::Url;
 
 use super::TaskExecutionBackend;
 use super::TaskExecutionConstraints;
+use super::TaskExecutionEvents;
 use super::TaskManager;
 use super::TaskManagerRequest;
 use super::TaskSpawnRequest;
 use crate::ONE_GIBIBYTE;
 use crate::SYSTEM;
+use crate::TaskExecutionResult;
 use crate::Value;
+use crate::WORK_DIR_NAME;
 use crate::config::DEFAULT_TASK_SHELL;
 use crate::config::LocalBackendConfig;
 use crate::config::TaskConfig;
@@ -36,7 +40,6 @@ use crate::v1::memory;
 ///
 /// This request contains the requested cpu and memory reservations for the task
 /// as well as the result receiver channel.
-#[derive(Debug)]
 struct LocalTaskRequest {
     /// The inner task spawn request.
     inner: TaskSpawnRequest,
@@ -63,10 +66,10 @@ impl TaskManagerRequest for LocalTaskRequest {
         self.memory
     }
 
-    async fn run(self, spawned: oneshot::Sender<()>) -> Result<i32> {
+    async fn run(self, spawned: oneshot::Sender<()>) -> Result<TaskExecutionResult> {
         // Create the working directory
-        let work_dir = self.inner.root.work_dir();
-        fs::create_dir_all(work_dir).with_context(|| {
+        let work_dir = self.inner.root.attempt_dir().join(WORK_DIR_NAME);
+        fs::create_dir_all(&work_dir).with_context(|| {
             format!(
                 "failed to create directory `{path}`",
                 path = work_dir.display()
@@ -107,7 +110,7 @@ impl TaskManagerRequest for LocalTaskRequest {
                 .unwrap_or(DEFAULT_TASK_SHELL),
         );
         command
-            .current_dir(work_dir)
+            .current_dir(&work_dir)
             .arg("-C")
             .arg(command_path)
             .stdin(Stdio::null())
@@ -160,9 +163,12 @@ impl TaskManagerRequest for LocalTaskRequest {
                     }
                 }
 
-                let status_code = status.code().expect("process should have exited");
-                info!("task process {id} has terminated with status code {status_code}");
-                Ok(status_code)
+                let exit_code = status.code().expect("process should have exited");
+                info!("task process {id} has terminated with status code {exit_code}");
+                Ok(TaskExecutionResult {
+                    exit_code,
+                    work_dir: Url::from_file_path(work_dir).expect("work directory path should be absolute")
+                })
             }
         }
     }
@@ -250,7 +256,12 @@ impl TaskExecutionBackend for LocalTaskExecutionBackend {
         })
     }
 
-    fn container_root_dir(&self) -> Option<&Path> {
+    fn guest_inputs_dir(&self) -> Option<&Path> {
+        // Local execution does not use a container
+        None
+    }
+
+    fn guest_work_dir(&self) -> Option<&Path> {
         // Local execution does not use a container
         None
     }
@@ -259,7 +270,7 @@ impl TaskExecutionBackend for LocalTaskExecutionBackend {
         &self,
         request: TaskSpawnRequest,
         token: CancellationToken,
-    ) -> Result<(oneshot::Receiver<()>, oneshot::Receiver<Result<i32>>)> {
+    ) -> Result<TaskExecutionEvents> {
         if !request.mounts.is_empty() {
             bail!("cannot spawn a local task with mount points");
         }
@@ -282,6 +293,9 @@ impl TaskExecutionBackend for LocalTaskExecutionBackend {
             completed_tx,
         );
 
-        Ok((spawned_rx, completed_rx))
+        Ok(TaskExecutionEvents {
+            spawned: spawned_rx,
+            completed: completed_rx,
+        })
     }
 }

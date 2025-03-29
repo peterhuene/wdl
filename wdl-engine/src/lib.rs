@@ -22,6 +22,7 @@ use sysinfo::CpuRefreshKind;
 use sysinfo::MemoryRefreshKind;
 use sysinfo::System;
 pub use units::*;
+use url::Url;
 pub use value::*;
 use wdl_analysis::diagnostics::unknown_type;
 use wdl_analysis::document::Document;
@@ -72,3 +73,32 @@ static SYSTEM: LazyLock<System> = LazyLock::new(|| {
     system.refresh_memory_specifics(MemoryRefreshKind::nothing().with_ram());
     system
 });
+
+/// Determines if the given string is prefixed with a `file` URL scheme.
+fn is_file_url(s: &str) -> bool {
+    s.get(0..7)
+        .map(|s| s.eq_ignore_ascii_case("file://"))
+        .unwrap_or(false)
+}
+
+/// Determines if the given string is prefixed with a supported URL scheme.
+fn is_url(s: &str) -> bool {
+    ["http://", "https://", "file://", "az://", "s3://", "gs://"]
+        .iter()
+        .any(|prefix| {
+            s.get(0..prefix.len())
+                .map(|s| s.eq_ignore_ascii_case(prefix))
+                .unwrap_or(false)
+        })
+}
+
+/// Parses a string into a URL.
+///
+/// Returns `None` if the string is not a supported scheme or not a valid URL.
+fn parse_url(s: &str) -> Option<Url> {
+    if !is_url(s) {
+        return None;
+    }
+
+    s.parse().ok()
+}
